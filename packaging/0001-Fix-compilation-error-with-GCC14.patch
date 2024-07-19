@@ -1,0 +1,31 @@
+From 1b4aa2311f06bc35e604a1adb404d64ded935a77 Mon Sep 17 00:00:00 2001
+From: Kyle Gospodnetich <kylego@microsoft.com>
+Date: Tue, 23 Jul 2024 10:13:27 -0700
+Subject: [PATCH] packaging: Fix compilation error with GCC14
+
+---
+ makeflags | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/makeflags b/makeflags
+index e008011..4fe71ea 100644
+--- a/makeflags
++++ b/makeflags
+@@ -1,11 +1,11 @@
+ # Default:
+-CCFLAGS = -Wall -Wextra -Werror -O3
++CCFLAGS = -Wall -Wextra -Werror -Wno-error=maybe-uninitialized -O3
+ 
+ # Optimized:
+-# CCFLAGS = -Wall -Wextra -Werror -O3 -march=native
++# CCFLAGS = -Wall -Wextra -Werror -Wno-error=maybe-uninitialized -O3 -march=native
+ 
+ # Debug:
+-# CCFLAGS = -Wall -Wextra -Werror -O0 -ggdb
++# CCFLAGS = -Wall -Wextra -Werror -Wno-error=maybe-uninitialized -O0 -ggdb
+ 
+ CCFLAGS += -I../include -D_FILE_OFFSET_BITS=64
+ 
+-- 
+2.45.2
+
