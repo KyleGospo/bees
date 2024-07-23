@@ -3,7 +3,7 @@ Version:        0.10
 Release:        %autorelease
 Summary:        Best-Effort Extent-Same, a btrfs dedupe agent
 
-License:        GPLv3
+License:        GPL-3.0-only AND MIT AND Zlib
 URL:            https://github.com/Zygo/bees
 
 Source:         %{url}/archive/refs/tags/v%{version}.tar.gz
