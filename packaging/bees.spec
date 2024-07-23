@@ -1,6 +1,6 @@
 Name:           bees
 Version:        0.10
-Release:        1%{?dist}
+Release:        %autorelease
 Summary:        Best-Effort Extent-Same, a btrfs dedupe agent
 
 License:        GPLv3
@@ -8,7 +8,8 @@ URL:            https://github.com/Zygo/bees
 
 Source:         %{url}/archive/refs/tags/v%{version}.tar.gz
 
-Patch0:         0001-Fix-compilation-error-with-GCC14.patch
+# https://github.com/Zygo/bees/pull/286
+Patch0:         286.patch
 
 BuildRequires:  make
 BuildRequires:  git
@@ -23,7 +24,6 @@ bees is a block-oriented userspace deduplication agent designed for large btrfs 
 %autosetup -p1
 
 %build
-%set_build_flags
 %make_build BEES_VERSION=%{version}
 
 %install
@@ -38,5 +38,4 @@ bees is a block-oriented userspace deduplication agent designed for large btrfs 
 %{_unitdir}/beesd@.service
 
 %changelog
-* Tue July 23 2024 - Kyle Gospodnetich <kylego@microsoft.com> - 0.10-1
-- Initial build
+%autochangelog
