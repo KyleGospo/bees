@@ -29,6 +29,15 @@ bees is a block-oriented userspace deduplication agent designed for large btrfs 
 %install
 %make_install LIBEXEC_PREFIX=%{_libexecdir}/bees SYSTEMD_SYSTEM_UNIT_DIR=%{_unitdir}
 
+%post
+%systemd_post 'bees@.service'
+ 
+%preun
+%systemd_preun 'bees@*.service'
+
+%postun
+%systemd_postun_with_restart 'bees@*.service'
+
 %files
 %license COPYING
 %doc README.md
