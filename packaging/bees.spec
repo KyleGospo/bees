@@ -18,7 +18,10 @@ BuildRequires:  btrfs-progs-devel
 BuildRequires:  systemd-rpm-macros
 
 %description
-bees is a block-oriented userspace deduplication agent designed for large btrfs filesystems. It is an offline dedupe combined with an incremental data scan capability to minimize time data spends on disk from write to dedupe.
+bees is a block-oriented userspace deduplication agent designed for
+large btrfs filesystems. It is an offline dedupe combined with an
+incremental data scan capability to minimize time data spends on disk
+from write to dedupe.
 
 %prep
 %autosetup -p1
@@ -41,9 +44,9 @@ bees is a block-oriented userspace deduplication agent designed for large btrfs 
 %files
 %license COPYING
 %doc README.md
-%{_libexecdir}/bees/bees
 %{_sbindir}/beesd
-%{_sysconfdir}/bees/*
+%{_libexecdir}/bees
+%{_sysconfdir}/bees
 %{_unitdir}/beesd@.service
 
 %changelog
