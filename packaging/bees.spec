@@ -12,7 +12,6 @@ Source:         %{url}/archive/refs/tags/v%{version}.tar.gz
 Patch0:         286.patch
 
 BuildRequires:  make
-BuildRequires:  git
 BuildRequires:  gcc-c++
 BuildRequires:  btrfs-progs-devel
 BuildRequires:  systemd-rpm-macros
@@ -25,12 +24,20 @@ from write to dedupe.
 
 %prep
 %autosetup -p1
+cat <<EOF > localconf
+BEES_VERSION=v%{version}
+DEFAULT_MAKE_TARGET=all
+LIBEXEC_PREFIX=%{_libexecdir}/%{name}
+LIB_PREFIX=%{_libdir}
+PREFIX=%{_prefix}
+SYSTEMD_SYSTEM_UNIT_DIR=%{_unitdir}
+EOF
 
 %build
-%make_build BEES_VERSION=%{version}
+%make_build
 
 %install
-%make_install LIBEXEC_PREFIX=%{_libexecdir}/bees SYSTEMD_SYSTEM_UNIT_DIR=%{_unitdir}
+%make_install
 
 %post
 %systemd_post 'bees@.service'
@@ -41,13 +48,16 @@ from write to dedupe.
 %postun
 %systemd_postun_with_restart 'bees@*.service'
 
+%check
+make test
+
 %files
 %license COPYING
 %doc README.md
 %{_sbindir}/beesd
-%{_libexecdir}/bees
-%{_sysconfdir}/bees
+%{_libexecdir}/%{name}
 %{_unitdir}/beesd@.service
+%config %{_sysconfdir}/%{name}/beesd.conf.sample
 
 %changelog
 %autochangelog
