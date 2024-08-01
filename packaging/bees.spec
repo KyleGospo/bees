@@ -40,7 +40,7 @@ EOF
 %make_install
 
 %post
-%systemd_post 'bees@.service'
+%systemd_post 'bees@*.service'
  
 %preun
 %systemd_preun 'bees@*.service'
