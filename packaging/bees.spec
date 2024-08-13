@@ -59,6 +59,7 @@ make test
 %{_sbindir}/beesd
 %{_libexecdir}/%{name}
 %{_unitdir}/beesd@.service
+%{_sysconfdir}/%{name}/
 %config %{_sysconfdir}/%{name}/beesd.conf.sample
 
 %changelog
