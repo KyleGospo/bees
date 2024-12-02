@@ -98,6 +98,9 @@ BeesContext::dump_status()
 		TaskMaster::print_queue(ofs);
 #endif
 
+		ofs << "PROGRESS:\n";
+		ofs << get_progress();
+
 		ofs.close();
 
 		BEESNOTE("renaming status file '" << status_file << "'");
@@ -110,6 +113,23 @@ BeesContext::dump_status()
 		}
 		m_stop_condvar.wait_for(lock, chrono::duration<double>(BEES_STATUS_INTERVAL));
 	}
+}
+
+void
+BeesContext::set_progress(const string &str)
+{
+	unique_lock<mutex> lock(m_progress_mtx);
+	m_progress_str = str;
+}
+
+string
+BeesContext::get_progress()
+{
+	unique_lock<mutex> lock(m_progress_mtx);
+	if (m_progress_str.empty()) {
+		return "[No progess estimate available]\n";
+	}
+	return m_progress_str;
 }
 
 void
@@ -159,6 +179,8 @@ BeesContext::show_progress()
 			BEESLOGINFO("\ttid " << t.first << ": " << t.second);
 		}
 
+		// No need to log progress here, it is logged when set
+
 		lastStats = thisStats;
 	}
 }
@@ -182,7 +204,7 @@ BeesContext::home_fd()
 }
 
 bool
-BeesContext::is_root_ro(uint64_t root)
+BeesContext::is_root_ro(uint64_t const root)
 {
 	return roots()->is_root_ro(root);
 }
@@ -264,6 +286,7 @@ BeesContext::rewrite_file_range(const BeesFileRange &bfr)
 	// BEESLOG("BeesResolver br(..., " << bfr << ")");
 	BEESTRACE("BeesContext::rewrite_file_range calling BeesResolver " << bfr);
 	BeesResolver br(m_ctx, BeesAddress(bfr.fd(), bfr.begin()));
+	BEESTRACE("BeesContext::rewrite_file_range calling replace_src " << dup_bbd);
 	// BEESLOG("\treplace_src " << dup_bbd);
 	br.replace_src(dup_bbd);
 	BEESCOUNT(scan_rewrite);
@@ -291,23 +314,36 @@ BeesContext::rewrite_file_range(const BeesFileRange &bfr)
 	}
 }
 
-BeesFileRange
+struct BeesSeenRange {
+	uint64_t bytenr;
+	off_t offset;
+	off_t length;
+};
+
+static
+bool
+operator<(const BeesSeenRange &bsr1, const BeesSeenRange &bsr2)
+{
+	return tie(bsr1.bytenr, bsr1.offset, bsr1.length) < tie(bsr2.bytenr, bsr2.offset, bsr2.length);
+}
+
+static
+__attribute__((unused))
+ostream&
+operator<<(ostream &os, const BeesSeenRange &tup)
+{
+	return os << "BeesSeenRange { " << to_hex(tup.bytenr) << ", " << to_hex(tup.offset) << "+" << pretty(tup.length) << " }";
+}
+
+void
 BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 {
 	BEESNOTE("Scanning " << pretty(e.size()) << " "
 		<< to_hex(e.begin()) << ".." << to_hex(e.end())
 		<< " " << name_fd(bfr.fd()) );
 	BEESTRACE("scan extent " << e);
+	BEESTRACE("scan bfr " << bfr);
 	BEESCOUNT(scan_extent);
-
-	// EXPERIMENT:  Don't bother with tiny extents unless they are the entire file.
-	// We'll take a tiny extent at BOF or EOF but not in between.
-	if (e.begin() && e.size() < 128 * 1024 && e.end() != Stat(bfr.fd()).st_size) {
-		BEESCOUNT(scan_extent_tiny);
-		// This doesn't work properly with the current architecture,
-		// so we don't do an early return here.
-		// return bfr;
-	}
 
 	// We keep moving this method around
 	auto m_ctx = shared_from_this();
@@ -328,7 +364,7 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 	if (e.flags() & Extent::HOLE) {
 		// Nothing here, dispose of this early
 		BEESCOUNT(scan_hole);
-		return bfr;
+		return;
 	}
 
 	if (e.flags() & Extent::PREALLOC) {
@@ -347,38 +383,57 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 		if (m_ctx->dedup(brp)) {
 			BEESCOUNT(dedup_prealloc_hit);
 			BEESCOUNTADD(dedup_prealloc_bytes, e.size());
-			return bfr;
+			return;
 		} else {
 			BEESCOUNT(dedup_prealloc_miss);
 		}
 	}
 
+	// If we already read this extent and inserted it into the hash table, no need to read it again
+	static mutex s_seen_mutex;
+	unique_lock<mutex> lock_seen(s_seen_mutex);
+	const BeesSeenRange tup = {
+		.bytenr = e.bytenr(),
+		.offset = e.offset(),
+		.length = e.size(),
+	};
+	static set<BeesSeenRange> s_seen;
+	if (s_seen.size() > BEES_MAX_EXTENT_REF_COUNT) {
+		s_seen.clear();
+		BEESCOUNT(scan_seen_clear);
+	}
+	const auto seen_rv = s_seen.find(tup) != s_seen.end();
+	if (!seen_rv) {
+		BEESCOUNT(scan_seen_miss);
+	} else {
+		// BEESLOGDEBUG("Skip " << tup << " " << e);
+		BEESCOUNT(scan_seen_hit);
+		return;
+	}
+	lock_seen.unlock();
+
 	// OK we need to read extent now
 	bees_readahead(bfr.fd(), bfr.begin(), bfr.size());
 
 	map<off_t, pair<BeesHash, BeesAddress>> insert_map;
-	set<off_t> noinsert_set;
-
-	// Hole handling
-	bool extent_compressed = e.flags() & FIEMAP_EXTENT_ENCODED;
-	bool extent_contains_zero = false;
-	bool extent_contains_nonzero = false;
-
-	// Need to replace extent
-	bool rewrite_extent = false;
+	set<off_t> dedupe_set;
+	set<off_t> zero_set;
 
 	// Pretty graphs
 	off_t block_count = ((e.size() + BLOCK_MASK_SUMS) & ~BLOCK_MASK_SUMS) / BLOCK_SIZE_SUMS;
 	BEESTRACE(e << " block_count " << block_count);
 	string bar(block_count, '#');
 
-	for (off_t next_p = e.begin(); next_p < e.end(); ) {
+	// List of dedupes found
+	list<BeesRangePair> dedupe_list;
+	list<BeesFileRange> copy_list;
+	list<pair<BeesHash, BeesAddress>> front_hash_list;
+	list<uint64_t> invalidate_addr_list;
 
-		// Guarantee forward progress
-		off_t p = next_p;
-		next_p += BLOCK_SIZE_SUMS;
+	off_t next_p = e.begin();
+	for (off_t p = e.begin(); p < e.end(); p += BLOCK_SIZE_SUMS) {
 
-		off_t bar_p = (p - e.begin()) / BLOCK_SIZE_SUMS;
+		const off_t bar_p = (p - e.begin()) / BLOCK_SIZE_SUMS;
 		BeesAddress addr(e, p);
 
 		// This extent should consist entirely of non-magic blocks
@@ -393,79 +448,72 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 
 		// Calculate the hash first because it lets us shortcut on is_data_zero
 		BEESNOTE("scan hash " << bbd);
-		BeesHash hash = bbd.hash();
+		const BeesHash hash = bbd.hash();
+
+		// Weed out zero blocks
+		BEESNOTE("is_data_zero " << bbd);
+		const bool data_is_zero = bbd.is_data_zero();
+		if (data_is_zero) {
+			bar.at(bar_p) = '0';
+			zero_set.insert(p);
+			BEESCOUNT(scan_zero);
+			continue;
+		}
 
 		// Schedule this block for insertion if we decide to keep this extent.
 		BEESCOUNT(scan_hash_preinsert);
 		BEESTRACE("Pushing hash " << hash << " addr " << addr << " bbd " << bbd);
 		insert_map.insert(make_pair(p, make_pair(hash, addr)));
-		bar.at(bar_p) = 'R';
+		bar.at(bar_p) = 'i';
 
-		// Weed out zero blocks
-		BEESNOTE("is_data_zero " << bbd);
-		bool extent_is_zero = bbd.is_data_zero();
-		if (extent_is_zero) {
-			bar.at(bar_p) = '0';
-			if (extent_compressed) {
-				if (!extent_contains_zero) {
-					// BEESLOG("compressed zero bbd " << bbd << "\n\tin extent " << e);
-				}
-				extent_contains_zero = true;
-				// Do not attempt to lookup hash of zero block
-				continue;
-			} else {
-				BEESLOGINFO("zero bbd " << bbd << "\n\tin extent " << e);
-				BEESCOUNT(scan_zero_uncompressed);
-				rewrite_extent = true;
-				break;
-			}
-		} else {
-			if (extent_contains_zero && !extent_contains_nonzero) {
-				// BEESLOG("compressed nonzero bbd " << bbd << "\n\tin extent " << e);
-			}
-			extent_contains_nonzero = true;
-		}
+		// Ensure we fill in the entire insert_map without skipping any non-zero blocks
+		if (p < next_p) continue;
 
 		BEESNOTE("lookup hash " << bbd);
-		auto found = hash_table->find_cell(hash);
+		const auto found = hash_table->find_cell(hash);
 		BEESCOUNT(scan_lookup);
 
-		set<BeesResolver> resolved_addrs;
 		set<BeesAddress> found_addrs;
+		list<BeesAddress> ordered_addrs;
 
-		// We know that there is at least one copy of the data and where it is,
-		// but we don't want to do expensive LOGICAL_INO operations unless there
-		// are at least two distinct addresses to look at.
-		found_addrs.insert(addr);
-
-		for (auto i : found) {
+		for (const auto &i : found) {
 			BEESTRACE("found (hash, address): " << i);
 			BEESCOUNT(scan_found);
 
 			// Hash has to match
 			THROW_CHECK2(runtime_error, i.e_hash, hash, i.e_hash == hash);
 
+			// We know that there is at least one copy of the data and where it is.
+			// Filter out anything that can't possibly match before we pull out the
+			// LOGICAL_INO hammer.
 			BeesAddress found_addr(i.e_addr);
 
-#if 0
 			// If address already in hash table, move on to next extent.
-			// We've already seen this block and may have made additional references to it.
-			// The current extent is effectively "pinned" and can't be modified any more.
+			// Only extents that are scanned but not modified are inserted, so if there's
+			// a matching hash:address pair in the hash table:
+			// 1.  We have already scanned this extent.
+			// 2.  We may have already created references to this extent.
+			// 3.  We won't scan this extent again.
+			// The current extent is effectively "pinned" and can't be modified
+			// without rescanning all the existing references.
 			if (found_addr.get_physical_or_zero() == addr.get_physical_or_zero()) {
+				// No log message because this happens to many thousands of blocks
+				// when bees is interrupted.
+				// BEESLOGDEBUG("Found matching hash " << hash << " at same address " << addr << ", skipping " << bfr);
 				BEESCOUNT(scan_already);
-				return bfr;
+				return;
 			}
-#endif
+
+			// Address is a duplicate.
+			// Check this early so we don't have duplicate counts.
+			if (!found_addrs.insert(found_addr).second) {
+				BEESCOUNT(scan_twice);
+				continue;
+			}
 
 			// Block must have matching EOF alignment
 			if (found_addr.is_unaligned_eof() != addr.is_unaligned_eof()) {
 				BEESCOUNT(scan_malign);
-				continue;
-			}
-
-			// Address is a duplicate
-			if (!found_addrs.insert(found_addr).second) {
-				BEESCOUNT(scan_twice);
 				continue;
 			}
 
@@ -476,201 +524,345 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 				// Extents may become non-toxic so give them a chance to expire.
 				// hash_table->push_front_hash_addr(hash, found_addr);
 				BEESCOUNT(scan_toxic_hash);
-				return bfr;
+				return;
 			}
 
-			// Distinct address, go resolve it
-			bool abandon_extent = false;
-			catch_all([&]() {
-				BEESNOTE("resolving " << found_addr << " matched " << bbd);
-				BEESTRACE("resolving " << found_addr << " matched " << bbd);
-				BEESTRACE("BeesContext::scan_one_extent calling BeesResolver " << found_addr);
-				BeesResolver resolved(m_ctx, found_addr);
-				// Toxic extents are really toxic
-				if (resolved.is_toxic()) {
-					BEESLOGWARN("WORKAROUND: discovered toxic match at found_addr " << found_addr << " matching bbd " << bbd);
-					BEESCOUNT(scan_toxic_match);
-					// Make sure we never see this hash again.
-					// It has become toxic since it was inserted into the hash table.
-					found_addr.set_toxic();
-					hash_table->push_front_hash_addr(hash, found_addr);
-					abandon_extent = true;
-				} else if (!resolved.count()) {
-					BEESCOUNT(scan_resolve_zero);
-					// Didn't find anything, address is dead
-					BEESTRACE("matched hash " << hash << " addr " << addr << " count zero");
-					hash_table->erase_hash_addr(hash, found_addr);
-				} else {
-					resolved_addrs.insert(resolved);
-					BEESCOUNT(scan_resolve_hit);
-				}
-			});
+			// Put this address in the list without changing hash table order
+			ordered_addrs.push_back(found_addr);
+		}
 
-			if (abandon_extent) {
-				return bfr;
+		// Cheap filtering is now out of the way, now for some heavy lifting
+		for (auto found_addr : ordered_addrs) {
+			// Hash table says there's a matching block on the filesystem.
+			// Go find refs to it.
+			BEESNOTE("resolving " << found_addr << " matched " << bbd);
+			BEESTRACE("resolving " << found_addr << " matched " << bbd);
+			BEESTRACE("BeesContext::scan_one_extent calling BeesResolver " << found_addr);
+			BeesResolver resolved(m_ctx, found_addr);
+			// Toxic extents are really toxic
+			if (resolved.is_toxic()) {
+				BEESLOGWARN("WORKAROUND: discovered toxic match at found_addr " << found_addr << " matching bbd " << bbd);
+				BEESCOUNT(scan_toxic_match);
+				// Make sure we never see this hash again.
+				// It has become toxic since it was inserted into the hash table.
+				found_addr.set_toxic();
+				hash_table->push_front_hash_addr(hash, found_addr);
+				return;
+			} else if (!resolved.count()) {
+				BEESCOUNT(scan_resolve_zero);
+				// Didn't find a block at the table address, address is dead
+				BEESLOGDEBUG("Erasing stale addr " << addr << " hash " << hash);
+				hash_table->erase_hash_addr(hash, found_addr);
+				continue;
+			} else {
+				BEESCOUNT(scan_resolve_hit);
 			}
-		}
 
-		// This shouldn't happen (often), so let's count it separately
-		if (resolved_addrs.size() > 2) {
-			BEESCOUNT(matched_3_or_more);
-		}
-		if (resolved_addrs.size() > 1) {
-			BEESCOUNT(matched_2_or_more);
-		}
-
-		// No need to do all this unless there are two or more distinct matches
-		if (!resolved_addrs.empty()) {
+			// `resolved` contains references to a block on the filesystem that still exists.
 			bar.at(bar_p) = 'M';
-			BEESCOUNT(matched_1_or_more);
-			BEESTRACE("resolved_addrs.size() = " << resolved_addrs.size());
-			BEESNOTE("resolving " << resolved_addrs.size() << " matches for hash " << hash);
 
-			BeesFileRange replaced_bfr;
+			BEESNOTE("finding one match (out of " << resolved.count() << ") at " << resolved.addr() << " for " << bbd);
+			BEESTRACE("finding one match (out of " << resolved.count() << ") at " << resolved.addr() << " for " << bbd);
+			auto replaced_brp = resolved.replace_dst(bbd);
+			BeesFileRange &replaced_bfr = replaced_brp.second;
+			BEESTRACE("next_p " << to_hex(next_p) << " -> replaced_bfr " << replaced_bfr);
 
-			BeesAddress last_replaced_addr;
-			for (auto it = resolved_addrs.begin(); it != resolved_addrs.end(); ++it) {
-				// FIXME:  Need to terminate this loop on replace_dst exception condition
-				// catch_all([&]() {
-					auto it_copy = *it;
-					BEESNOTE("finding one match (out of " << it_copy.count() << ") at " << it_copy.addr() << " for " << bbd);
-					BEESTRACE("finding one match (out of " << it_copy.count() << ") at " << it_copy.addr() << " for " << bbd);
-					replaced_bfr = it_copy.replace_dst(bbd);
-					BEESTRACE("next_p " << to_hex(next_p) << " -> replaced_bfr " << replaced_bfr);
-
-					// If we didn't find this hash where the hash table said it would be,
-					// correct the hash table.
-					if (it_copy.found_hash()) {
-						BEESCOUNT(scan_hash_hit);
-					} else {
-						// BEESLOGDEBUG("erase src hash " << hash << " addr " << it_copy.addr());
-						BEESCOUNT(scan_hash_miss);
-						hash_table->erase_hash_addr(hash, it_copy.addr());
-					}
-
-					if (it_copy.found_dup()) {
-						BEESCOUNT(scan_dup_hit);
-
-						// FIXME:  we will thrash if we let multiple references to identical blocks
-						// exist in the hash table.  Erase all but the last one.
-						if (last_replaced_addr) {
-							BEESLOGINFO("Erasing redundant hash " << hash << " addr " << last_replaced_addr);
-							hash_table->erase_hash_addr(hash, last_replaced_addr);
-							BEESCOUNT(scan_erase_redundant);
-						}
-						last_replaced_addr = it_copy.addr();
-
-						// Invalidate resolve cache so we can count refs correctly
-						m_ctx->invalidate_addr(it_copy.addr());
-						m_ctx->invalidate_addr(bbd.addr());
-
-						// Remove deduped blocks from insert map
-						THROW_CHECK0(runtime_error, replaced_bfr);
-						for (off_t ip = replaced_bfr.begin(); ip < replaced_bfr.end(); ip += BLOCK_SIZE_SUMS) {
-							BEESCOUNT(scan_dup_block);
-							noinsert_set.insert(ip);
-							if (ip >= e.begin() && ip < e.end()) {
-								off_t bar_p = (ip - e.begin()) / BLOCK_SIZE_SUMS;
-								bar.at(bar_p) = 'd';
-							}
-						}
-
-						// next_p may be past EOF so check p only
-						THROW_CHECK2(runtime_error, p, replaced_bfr, p < replaced_bfr.end());
-
-						BEESCOUNT(scan_bump);
-						next_p = replaced_bfr.end();
-					} else {
-						BEESCOUNT(scan_dup_miss);
-					}
-				// });
+			// If we did find a block, but not this hash, correct the hash table and move on
+			if (resolved.found_hash()) {
+				BEESCOUNT(scan_hash_hit);
+			} else {
+				BEESLOGDEBUG("Erasing stale hash " << hash << " addr " << resolved.addr());
+				hash_table->erase_hash_addr(hash, resolved.addr());
+				BEESCOUNT(scan_hash_miss);
+				continue;
 			}
-			if (last_replaced_addr) {
-				// If we replaced extents containing the incoming addr,
-				// push the addr we kept to the front of the hash LRU.
-				hash_table->push_front_hash_addr(hash, last_replaced_addr);
-				BEESCOUNT(scan_push_front);
+
+			// We found a block and it was a duplicate
+			if (resolved.found_dup()) {
+				THROW_CHECK0(runtime_error, replaced_bfr);
+				BEESCOUNT(scan_dup_hit);
+
+				// Save this match.  If a better match is found later,
+				// it will be replaced.
+				dedupe_list.push_back(replaced_brp);
+
+				// Push matching block to front of LRU
+				front_hash_list.push_back(make_pair(hash, resolved.addr()));
+
+				// This is the block that matched in the replaced bfr
+				bar.at(bar_p) = '=';
+
+				// Invalidate resolve cache so we can count refs correctly
+				invalidate_addr_list.push_back(resolved.addr());
+				invalidate_addr_list.push_back(bbd.addr());
+
+				// next_p may be past EOF so check p only
+				THROW_CHECK2(runtime_error, p, replaced_bfr, p < replaced_bfr.end());
+
+				// We may find duplicate ranges of various lengths, so make sure
+				// we don't pick a smaller one
+				next_p = max(next_p, replaced_bfr.end());
+
+				// Stop after one dedupe is found.  If there's a longer matching range
+				// out there, we'll find a matching block after the end of this range,
+				// since the longer range is longer than this one.
+				break;
+			} else {
+				BEESCOUNT(scan_dup_miss);
 			}
-		} else {
-			BEESCOUNT(matched_0);
 		}
 	}
 
-	// If the extent was compressed and all zeros, nuke entire thing
-	if (!rewrite_extent && (extent_contains_zero && !extent_contains_nonzero)) {
-		rewrite_extent = true;
-		BEESCOUNT(scan_zero_compressed);
+	bool force_insert = false;
+
+	// We don't want to punch holes into compressed extents, unless:
+	// 1.  There was dedupe of non-zero blocks, so we always have to copy the rest of the extent
+	// 2.  The entire extent is zero and the whole thing can be replaced with a single hole
+	const bool extent_compressed = e.flags() & FIEMAP_EXTENT_ENCODED;
+	if (extent_compressed && dedupe_list.empty() && !insert_map.empty()) {
+		// BEESLOGDEBUG("Compressed extent with non-zero data and no dedupe, skipping");
+		BEESCOUNT(scan_compressed_no_dedup);
+		force_insert = true;
 	}
 
-	// If we deduped any blocks then we must rewrite the remainder of the extent
-	if (!noinsert_set.empty()) {
-		rewrite_extent = true;
+	// FIXME:  dedupe_list contains a lot of overlapping matches.  Get rid of all but one.
+	list<BeesRangePair> dedupe_list_out;
+	dedupe_list.sort([](const BeesRangePair &a, const BeesRangePair &b) {
+		return b.second.size() < a.second.size();
+	});
+	// Shorten each dedupe brp by removing any overlap with earlier (longer) extents in list
+	for (auto i : dedupe_list) {
+		bool insert_i = true;
+		BEESTRACE("i = " << i << " insert_i " << insert_i);
+		for (const auto &j : dedupe_list_out) {
+			BEESTRACE("j = " << j);
+			// No overlap, try next one
+			if (j.second.end() <= i.second.begin() || j.second.begin() >= i.second.end()) {
+				continue;
+			}
+			// j fully overlaps or is the same as i, drop i
+			if (j.second.begin() <= i.second.begin() && j.second.end() >= i.second.end()) {
+				insert_i = false;
+				break;
+			}
+			// i begins outside j, i ends inside j, remove the end of i
+			if (i.second.end() > j.second.begin() && i.second.begin() <= j.second.begin()) {
+				const auto delta = i.second.end() - j.second.begin();
+				if (delta == i.second.size()) {
+					insert_i = false;
+					break;
+				}
+				i.shrink_end(delta);
+				continue;
+			}
+			// i begins inside j, ends outside j, remove the begin of i
+			if (i.second.begin() < j.second.end() && i.second.end() >= j.second.end()) {
+				const auto delta = j.second.end() - i.second.begin();
+				if (delta == i.second.size()) {
+					insert_i = false;
+					break;
+				}
+				i.shrink_begin(delta);
+				continue;
+			}
+			// i fully overlaps j, split i into two parts, push the other part onto dedupe_list
+			if (j.second.begin() > i.second.begin() && j.second.end() < i.second.end()) {
+				auto other_i = i;
+				const auto end_left_delta = i.second.end() - j.second.begin();
+				const auto begin_right_delta = i.second.begin() - j.second.end();
+				i.shrink_end(end_left_delta);
+				other_i.shrink_begin(begin_right_delta);
+				dedupe_list.push_back(other_i);
+				continue;
+			}
+			// None of the sbove.  Oops!
+			THROW_CHECK0(runtime_error, false);
+		}
+		if (insert_i) {
+			dedupe_list_out.push_back(i);
+		}
+	}
+	dedupe_list = dedupe_list_out;
+	dedupe_list_out.clear();
+
+	// Count total dedupes
+	uint64_t bytes_deduped = 0;
+	for (const auto &i : dedupe_list) {
+		// Remove deduped blocks from insert map and zero map
+		for (off_t ip = i.second.begin(); ip < i.second.end(); ip += BLOCK_SIZE_SUMS) {
+			BEESCOUNT(scan_dup_block);
+			dedupe_set.insert(ip);
+			zero_set.erase(ip);
+		}
+		bytes_deduped += i.second.size();
 	}
 
-	// If we need to replace part of the extent, rewrite all instances of it
-	if (rewrite_extent) {
-		bool blocks_rewritten = false;
+	// Copy all blocks of the extent that were not deduped or zero, but don't copy an entire extent
+	uint64_t bytes_zeroed = 0;
+	if (!force_insert) {
 		BEESTRACE("Rewriting extent " << e);
 		off_t last_p = e.begin();
 		off_t p = last_p;
-		off_t next_p;
+		off_t next_p = last_p;
 		BEESTRACE("next_p " << to_hex(next_p) << " p " << to_hex(p) << " last_p " << to_hex(last_p));
 		for (next_p = e.begin(); next_p < e.end(); ) {
 			p = next_p;
-			next_p += BLOCK_SIZE_SUMS;
+			next_p = min(next_p + BLOCK_SIZE_SUMS, e.end());
 
-			// BEESLOG("noinsert_set.count(" << to_hex(p) << ") " << noinsert_set.count(p));
-			if (noinsert_set.count(p)) {
+			// Can't be both dedupe and zero
+			THROW_CHECK2(runtime_error, zero_set.count(p), dedupe_set.count(p), zero_set.count(p) + dedupe_set.count(p) < 2);
+			if (zero_set.count(p)) {
+				bytes_zeroed += next_p - p;
+			}
+			// BEESLOG("dedupe_set.count(" << to_hex(p) << ") " << dedupe_set.count(p));
+			if (dedupe_set.count(p)) {
 				if (p - last_p > 0) {
-					rewrite_file_range(BeesFileRange(bfr.fd(), last_p, p));
-					blocks_rewritten = true;
+					THROW_CHECK2(runtime_error, p, e.end(), p <= e.end());
+					copy_list.push_back(BeesFileRange(bfr.fd(), last_p, p));
 				}
 				last_p = next_p;
-			} else {
-				off_t bar_p = (p - e.begin()) / BLOCK_SIZE_SUMS;
-				bar.at(bar_p) = '+';
 			}
 		}
 		BEESTRACE("last");
-		if (next_p - last_p > 0) {
-			rewrite_file_range(BeesFileRange(bfr.fd(), last_p, next_p));
-			blocks_rewritten = true;
-		}
-		if (blocks_rewritten) {
-			// Nothing left to insert, all blocks clobbered
-			insert_map.clear();
-		} else {
-			// BEESLOG("No blocks rewritten");
-			BEESCOUNT(scan_no_rewrite);
+		if (next_p > last_p) {
+			THROW_CHECK2(runtime_error, next_p, e.end(), next_p <= e.end());
+			copy_list.push_back(BeesFileRange(bfr.fd(), last_p, next_p));
 		}
 	}
 
-	// We did not rewrite the extent and it contained data, so insert it.
-	for (auto i : insert_map) {
-		off_t bar_p = (i.first - e.begin()) / BLOCK_SIZE_SUMS;
-		BEESTRACE("e " << e << "bar_p = " << bar_p << " i.first-e.begin() " << i.first - e.begin() << " i.second " << i.second.first << ", " << i.second.second);
-		if (noinsert_set.count(i.first)) {
-			// FIXME:  we removed one reference to this copy.  Avoid thrashing?
-			hash_table->erase_hash_addr(i.second.first, i.second.second);
-			// Block was clobbered, do not insert
-			// Will look like 'Ddddd' because we skip deduped blocks
-			bar.at(bar_p) = 'D';
-			BEESCOUNT(inserted_clobbered);
+	// Don't copy an entire extent
+	if (!bytes_zeroed && copy_list.size() == 1 && copy_list.begin()->size() == e.size()) {
+		copy_list.clear();
+	}
+
+	// Count total copies
+	uint64_t bytes_copied = 0;
+	for (const auto &i : copy_list) {
+		bytes_copied += i.size();
+	}
+
+	BEESTRACE("bar: " << bar);
+
+	// Don't do nuisance dedupes part 1:  free more blocks than we create
+	THROW_CHECK3(runtime_error, bytes_copied, bytes_zeroed, bytes_deduped, bytes_copied >= bytes_zeroed);
+	const auto cost_copy = bytes_copied - bytes_zeroed;
+	const auto gain_dedupe = bytes_deduped + bytes_zeroed;
+	if (cost_copy > gain_dedupe) {
+		BEESLOGDEBUG("Too many bytes copied (" << pretty(bytes_copied) << ") for bytes deduped (" << pretty(bytes_deduped) << ") and holes punched (" << pretty(bytes_zeroed) << "), skipping extent");
+		BEESCOUNT(scan_skip_bytes);
+		force_insert = true;
+	}
+
+	// Don't do nuisance dedupes part 2:  nobody needs more than 100 dedupe/copy ops in one extent
+	if (dedupe_list.size() + copy_list.size() > 100) {
+		BEESLOGDEBUG("Too many dedupe (" << dedupe_list.size() << ") and copy (" << copy_list.size() << ") operations, skipping extent");
+		BEESCOUNT(scan_skip_ops);
+		force_insert = true;
+	}
+
+	// Track whether we rewrote anything
+	bool extent_modified = false;
+
+	// If we didn't delete the dedupe list, do the dedupes now
+	for (const auto &i : dedupe_list) {
+		BEESNOTE("dedup " << i);
+		if (force_insert || m_ctx->dedup(i)) {
+			BEESCOUNT(replacedst_dedup_hit);
+			THROW_CHECK0(runtime_error, i.second);
+			for (off_t ip = i.second.begin(); ip < i.second.end(); ip += BLOCK_SIZE_SUMS) {
+				if (ip >= e.begin() && ip < e.end()) {
+					off_t bar_p = (ip - e.begin()) / BLOCK_SIZE_SUMS;
+					if (bar.at(bar_p) != '=') {
+						if (ip == i.second.begin()) {
+							bar.at(bar_p) = '<';
+						} else if (ip + BLOCK_SIZE_SUMS >= i.second.end()) {
+							bar.at(bar_p) = '>';
+						} else {
+							bar.at(bar_p) = 'd';
+						}
+					}
+				}
+			}
+			extent_modified = !force_insert;
 		} else {
+			BEESLOGINFO("dedup failed: " << i);
+			BEESCOUNT(replacedst_dedup_miss);
+			// User data changed while we were looking up the extent, or we have a bug.
+			// We can't fix this, but we can immediately stop wasting effort.
+			return;
+		}
+	}
+
+	// Then the copy/rewrites
+	for (const auto &i : copy_list) {
+		if (!force_insert) {
+			rewrite_file_range(i);
+			extent_modified = true;
+		}
+		for (auto p = i.begin(); p < i.end(); p += BLOCK_SIZE_SUMS) {
+			off_t bar_p = (p - e.begin()) / BLOCK_SIZE_SUMS;
+			// Leave zeros as-is because they aren't really copies
+			if (bar.at(bar_p) != '0') {
+				bar.at(bar_p) = '+';
+			}
+		}
+	}
+
+	if (!force_insert) {
+		// Push matched hashes to front
+		for (const auto &i : front_hash_list) {
+			hash_table->push_front_hash_addr(i.first, i.second);
+			BEESCOUNT(scan_push_front);
+		}
+		// Invalidate cached resolves
+		for (const auto &i : invalidate_addr_list) {
+			m_ctx->invalidate_addr(i);
+		}
+	}
+
+	// Don't insert hashes pointing to an extent we just deleted
+	if (!extent_modified) {
+		// We did not rewrite the extent and it contained data, so insert it.
+		// BEESLOGDEBUG("Inserting " << insert_map.size() << " hashes from " << bfr);
+		for (const auto &i : insert_map) {
 			hash_table->push_random_hash_addr(i.second.first, i.second.second);
-			bar.at(bar_p) = '.';
-			BEESCOUNT(inserted_block);
+			off_t bar_p = (i.first - e.begin()) / BLOCK_SIZE_SUMS;
+			if (bar.at(bar_p) == 'i') {
+				bar.at(bar_p) = '.';
+			}
+			BEESCOUNT(scan_hash_insert);
 		}
 	}
 
 	// Visualize
 	if (bar != string(block_count, '.')) {
-		BEESLOGINFO("scan: " << pretty(e.size()) << " " << to_hex(e.begin()) << " [" << bar << "] " << to_hex(e.end()) << ' ' << name_fd(bfr.fd()));
+		BEESLOGINFO(
+			(force_insert ? "skip" : "scan") << ": "
+			<< pretty(e.size()) << " "
+			<< dedupe_list.size() << "d" << copy_list.size() << "c"
+			<< ((bytes_zeroed + BLOCK_SIZE_SUMS - 1) / BLOCK_SIZE_SUMS) << "p"
+			<< (extent_compressed ? "z {" : " {")
+			<< to_hex(e.bytenr()) << "+" << to_hex(e.offset()) << "} "
+			<< to_hex(e.begin()) << " [" << bar << "] " << to_hex(e.end())
+			<< ' ' << name_fd(bfr.fd())
+		);
 	}
 
-	// Costs 10% on benchmarks
+	// Put this extent into the recently seen list if we didn't rewrite it,
+	// and remove it if we did.
+	lock_seen.lock();
+	if (extent_modified) {
+		s_seen.erase(tup);
+		BEESCOUNT(scan_seen_erase);
+	} else {
+		// BEESLOGDEBUG("Seen " << tup << " " << e);
+		s_seen.insert(tup);
+		BEESCOUNT(scan_seen_insert);
+	}
+	lock_seen.unlock();
+
+	// Now causes 75% loss of performance in benchmarks
 	// bees_unreadahead(bfr.fd(), bfr.begin(), bfr.size());
-	return bfr;
 }
 
 shared_ptr<Exclusion>
@@ -703,14 +895,14 @@ BeesContext::scan_forward(const BeesFileRange &bfr_in)
 	// No FD?  Well, that was quick.
 	if (!bfr.fd()) {
 		// BEESLOGINFO("No FD in " << root_path() << " for " << bfr);
-		BEESCOUNT(scan_no_fd);
+		BEESCOUNT(scanf_no_fd);
 		return false;
 	}
 
 	// Sanity check
 	if (bfr.begin() >= bfr.file_size()) {
 		BEESLOGWARN("past EOF: " << bfr);
-		BEESCOUNT(scan_eof);
+		BEESCOUNT(scanf_eof);
 		return false;
 	}
 
@@ -730,9 +922,11 @@ BeesContext::scan_forward(const BeesFileRange &bfr_in)
 					// BEESLOGDEBUG("Deferring extent bytenr " << to_hex(extent_bytenr) << " from " << bfr);
 					BEESCOUNT(scanf_deferred_extent);
 					start_over = true;
+					return; // from closure
 				}
 				Timer one_extent_timer;
 				scan_one_extent(bfr, e);
+				// BEESLOGDEBUG("Scanned " << e << " " << bfr);
 				BEESCOUNTADD(scanf_extent_ms, one_extent_timer.age() * 1000);
 				BEESCOUNT(scanf_extent);
 			});

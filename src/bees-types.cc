@@ -183,6 +183,24 @@ BeesFileRange::grow_begin(off_t delta)
 	return m_begin;
 }
 
+off_t
+BeesFileRange::shrink_begin(off_t delta)
+{
+	THROW_CHECK1(invalid_argument, delta, delta > 0);
+	THROW_CHECK3(invalid_argument, delta, m_begin, m_end, delta + m_begin < m_end);
+	m_begin += delta;
+	return m_begin;
+}
+
+off_t
+BeesFileRange::shrink_end(off_t delta)
+{
+	THROW_CHECK1(invalid_argument, delta, delta > 0);
+	THROW_CHECK2(invalid_argument, delta, m_end, m_end >= delta);
+	m_end -= delta;
+	return m_end;
+}
+
 BeesFileRange::BeesFileRange(const BeesBlockData &bbd) :
 	m_fd(bbd.fd()),
 	m_begin(bbd.begin()),
@@ -349,8 +367,8 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 	BEESTRACE("e_second " << e_second);
 
 	// Preread entire extent
-	bees_readahead(second.fd(), e_second.begin(), e_second.size());
-	bees_readahead(first.fd(), e_second.begin() + first.begin() - second.begin(), e_second.size());
+	bees_readahead_pair(second.fd(), e_second.begin(), e_second.size(),
+			    first.fd(), e_second.begin() + first.begin() - second.begin(), e_second.size());
 
 	auto hash_table = ctx->hash_table();
 
@@ -388,17 +406,6 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 			break;
 		}
 
-		// Source extent cannot be toxic
-		BeesAddress first_addr(first.fd(), new_first.begin());
-		if (!first_addr.is_magic()) {
-			auto first_resolved = ctx->resolve_addr(first_addr);
-			if (first_resolved.is_toxic()) {
-				BEESLOGWARN("WORKAROUND: not growing matching pair backward because src addr is toxic:\n" << *this);
-				BEESCOUNT(pairbackward_toxic_addr);
-				break;
-			}
-		}
-
 		// Extend second range.  If we hit BOF we can go no further.
 		BeesFileRange new_second = second;
 		BEESTRACE("new_second = " << new_second);
@@ -434,6 +441,7 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 		}
 
 		// Source block cannot be zero in a non-compressed non-magic extent
+		BeesAddress first_addr(first.fd(), new_first.begin());
 		if (first_bbd.is_data_zero() && !first_addr.is_magic() && !first_addr.is_compressed()) {
 			BEESCOUNT(pairbackward_zero);
 			break;
@@ -491,17 +499,6 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 			break;
 		}
 
-		// Source extent cannot be toxic
-		BeesAddress first_addr(first.fd(), new_first.begin());
-		if (!first_addr.is_magic()) {
-			auto first_resolved = ctx->resolve_addr(first_addr);
-			if (first_resolved.is_toxic()) {
-				BEESLOGWARN("WORKAROUND: not growing matching pair forward because src is toxic:\n" << *this);
-				BEESCOUNT(pairforward_toxic);
-				break;
-			}
-		}
-
 		// Extend second range.  If we hit EOF we can go no further.
 		BeesFileRange new_second = second;
 		BEESTRACE("new_second = " << new_second);
@@ -545,6 +542,7 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 		}
 
 		// Source block cannot be zero in a non-compressed non-magic extent
+		BeesAddress first_addr(first.fd(), new_first.begin());
 		if (first_bbd.is_data_zero() && !first_addr.is_magic() && !first_addr.is_compressed()) {
 			BEESCOUNT(pairforward_zero);
 			break;
@@ -587,6 +585,22 @@ BeesRangePair
 BeesRangePair::copy_closed() const
 {
 	return BeesRangePair(first.copy_closed(), second.copy_closed());
+}
+
+void
+BeesRangePair::shrink_begin(off_t const delta)
+{
+	first.shrink_begin(delta);
+	second.shrink_begin(delta);
+	THROW_CHECK2(runtime_error, first.size(), second.size(), first.size() == second.size());
+}
+
+void
+BeesRangePair::shrink_end(off_t const delta)
+{
+	first.shrink_end(delta);
+	second.shrink_end(delta);
+	THROW_CHECK2(runtime_error, first.size(), second.size(), first.size() == second.size());
 }
 
 ostream &

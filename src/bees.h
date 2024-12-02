@@ -78,13 +78,13 @@ const int BEES_PROGRESS_INTERVAL = BEES_STATS_INTERVAL;
 const int BEES_STATUS_INTERVAL = 1;
 
 // Number of file FDs to cache when not in active use
-const size_t BEES_FILE_FD_CACHE_SIZE = 4096;
+const size_t BEES_FILE_FD_CACHE_SIZE = 32768;
 
 // Number of root FDs to cache when not in active use
-const size_t BEES_ROOT_FD_CACHE_SIZE = 1024;
+const size_t BEES_ROOT_FD_CACHE_SIZE = 4096;
 
 // Number of FDs to open (rlimit)
-const size_t BEES_OPEN_FILE_LIMIT = (BEES_FILE_FD_CACHE_SIZE + BEES_ROOT_FD_CACHE_SIZE) * 2 + 100;
+const size_t BEES_OPEN_FILE_LIMIT = BEES_FILE_FD_CACHE_SIZE + BEES_ROOT_FD_CACHE_SIZE + 100;
 
 // Worker thread factor (multiplied by detected number of CPU cores)
 const double BEES_DEFAULT_THREAD_FACTOR = 1.0;
@@ -93,10 +93,11 @@ const double BEES_DEFAULT_THREAD_FACTOR = 1.0;
 const double BEES_TOO_LONG = 5.0;
 
 // Avoid any extent where LOGICAL_INO takes this much kernel CPU time
-const double BEES_TOXIC_SYS_DURATION = 0.1;
+const double BEES_TOXIC_SYS_DURATION = 5.0;
 
-// Maximum number of refs to a single extent
-const size_t BEES_MAX_EXTENT_REF_COUNT = (16 * 1024 * 1024 / 24) - 1;
+// Maximum number of refs to a single extent before we have other problems
+// If we have more than 10K refs to an extent, adding another will save 0.01% space
+const size_t BEES_MAX_EXTENT_REF_COUNT = 9999; // (16 * 1024 * 1024 / 24);
 
 // How long between hash table histograms
 const double BEES_HASH_TABLE_ANALYZE_INTERVAL = BEES_STATS_INTERVAL;
@@ -123,7 +124,7 @@ const int FLAGS_OPEN_FANOTIFY = O_RDWR | O_NOATIME | O_CLOEXEC | O_LARGEFILE;
 #define BEESLOG(lv,x)   do { if (lv < bees_log_level) { Chatter __chatter(lv, BeesNote::get_name()); __chatter << x; } } while (0)
 #define BEESLOGTRACE(x) do { BEESLOG(LOG_DEBUG, x); BeesTracer::trace_now(); } while (0)
 
-#define BEESTRACE(x)   BeesTracer  SRSLY_WTF_C(beesTracer_,  __LINE__) ([&]()                 { BEESLOG(LOG_ERR, x);   })
+#define BEESTRACE(x)   BeesTracer  SRSLY_WTF_C(beesTracer_,  __LINE__) ([&]()                 { BEESLOG(LOG_ERR, x << " at " << __FILE__ << ":" << __LINE__);   })
 #define BEESTOOLONG(x) BeesTooLong SRSLY_WTF_C(beesTooLong_, __LINE__) ([&](ostream &_btl_os) { _btl_os << x; })
 #define BEESNOTE(x)    BeesNote    SRSLY_WTF_C(beesNote_,    __LINE__) ([&](ostream &_btl_os) { _btl_os << x; })
 
@@ -297,6 +298,11 @@ public:
 	/// @{ Make range larger
 	off_t grow_end(off_t delta);
 	off_t grow_begin(off_t delta);
+	/// @}
+
+	/// @{ Make range smaller
+	off_t shrink_end(off_t delta);
+	off_t shrink_begin(off_t delta);
 	/// @}
 
 friend ostream & operator<<(ostream &os, const BeesFileRange &bfr);
@@ -515,7 +521,7 @@ class BeesCrawl {
 
 	bool fetch_extents();
 	void fetch_extents_harder();
-	bool next_transid();
+	bool restart_crawl();
 	BeesFileRange bti_to_bfr(const BtrfsTreeItem &bti) const;
 
 public:
@@ -527,6 +533,8 @@ public:
 	BeesCrawlState get_state_end() const;
 	void set_state(const BeesCrawlState &bcs);
 	void deferred(bool def_setting);
+	bool deferred() const;
+	bool finished() const;
 };
 
 class BeesScanMode;
@@ -555,16 +563,12 @@ class BeesRoots : public enable_shared_from_this<BeesRoots> {
 	bool					m_stop_requested = false;
 
 	void insert_new_crawl();
-	void insert_root(const BeesCrawlState &bcs);
 	Fd open_root_nocache(uint64_t root);
 	Fd open_root_ino_nocache(uint64_t root, uint64_t ino);
-	uint64_t transid_min();
-	uint64_t transid_max();
 	uint64_t transid_max_nocache();
 	void state_load();
 	ostream &state_to_stream(ostream &os);
 	void state_save();
-	bool crawl_roots();
 	string crawl_state_filename() const;
 	void crawl_state_set_dirty();
 	void crawl_state_erase(const BeesCrawlState &bcs);
@@ -575,6 +579,9 @@ class BeesRoots : public enable_shared_from_this<BeesRoots> {
 	RateEstimator& transid_re();
 	bool crawl_batch(shared_ptr<BeesCrawl> crawl);
 	void clear_caches();
+
+friend class BeesScanModeExtent;
+	shared_ptr<BeesCrawl> insert_root(const BeesCrawlState &bcs);
 
 friend class BeesCrawl;
 friend class BeesFdCache;
@@ -594,17 +601,20 @@ public:
 	Fd open_root_ino(const BeesFileId &bfi) { return open_root_ino(bfi.root(), bfi.ino()); }
 	bool is_root_ro(uint64_t root);
 
-	// TODO:  do extent-tree scans instead
 	enum ScanMode {
 		SCAN_MODE_LOCKSTEP,
 		SCAN_MODE_INDEPENDENT,
 		SCAN_MODE_SEQUENTIAL,
 		SCAN_MODE_RECENT,
+		SCAN_MODE_EXTENT,
 		SCAN_MODE_COUNT, // must be last
 	};
 
 	void set_scan_mode(ScanMode new_mode);
 	void set_workaround_btrfs_send(bool do_avoid);
+
+	uint64_t transid_min();
+	uint64_t transid_max();
 };
 
 struct BeesHash {
@@ -664,6 +674,8 @@ class BeesRangePair : public pair<BeesFileRange, BeesFileRange> {
 public:
 	BeesRangePair(const BeesFileRange &src, const BeesFileRange &dst);
 	bool grow(shared_ptr<BeesContext> ctx, bool constrained);
+	void shrink_begin(const off_t delta);
+	void shrink_end(const off_t delta);
 	BeesRangePair copy_closed() const;
 	bool operator<(const BeesRangePair &that) const;
 friend ostream & operator<<(ostream &os, const BeesRangePair &brp);
@@ -737,11 +749,14 @@ class BeesContext : public enable_shared_from_this<BeesContext> {
 	shared_ptr<BeesThread>				m_progress_thread;
 	shared_ptr<BeesThread>				m_status_thread;
 
+	mutex						m_progress_mtx;
+	string						m_progress_str;
+
 	void set_root_fd(Fd fd);
 
 	BeesResolveAddrResult resolve_addr_uncached(BeesAddress addr);
 
-	BeesFileRange scan_one_extent(const BeesFileRange &bfr, const Extent &e);
+	void scan_one_extent(const BeesFileRange &bfr, const Extent &e);
 	void rewrite_file_range(const BeesFileRange &bfr);
 
 public:
@@ -772,6 +787,8 @@ public:
 
 	void dump_status();
 	void show_progress();
+	void set_progress(const string &str);
+	string get_progress();
 
 	void start();
 	void stop();
@@ -834,7 +851,7 @@ public:
 	BeesFileRange find_one_match(BeesHash hash);
 
 	void replace_src(const BeesFileRange &src_bfr);
-	BeesFileRange replace_dst(const BeesFileRange &dst_bfr);
+	BeesRangePair replace_dst(const BeesFileRange &dst_bfr);
 
 	bool found_addr() const { return m_found_addr; }
 	bool found_data() const { return m_found_data; }
@@ -868,6 +885,7 @@ extern const char *BEES_VERSION;
 extern thread_local default_random_engine bees_generator;
 string pretty(double d);
 void bees_readahead(int fd, off_t offset, size_t size);
+void bees_readahead_pair(int fd, off_t offset, size_t size, int fd2, off_t offset2, size_t size2);
 void bees_unreadahead(int fd, off_t offset, size_t size);
 string format_time(time_t t);
 

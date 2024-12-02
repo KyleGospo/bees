@@ -356,6 +356,8 @@ BeesHashTable::prefetch_loop()
 		auto avg_rates = thisStats / m_ctx->total_timer().age();
 		graph_blob << "\t" << avg_rates << "\n";
 
+		graph_blob << m_ctx->get_progress();
+
 		BEESLOGINFO(graph_blob.str());
 		catch_all([&]() {
 			m_stats_file.write(graph_blob.str());
@@ -446,10 +448,38 @@ BeesHashTable::fetch_missing_extent_by_index(uint64_t extent_index)
 
 		// If we are in prefetch, give the kernel a hint about the next extent
 		if (m_prefetch_running) {
-			// XXX: don't call this if bees_readahead is implemented by pread()
-			bees_readahead(m_fd, dirty_extent_offset + dirty_extent_size, dirty_extent_size);
+			// Use the kernel readahead here, because it might work for this use case
+			readahead(m_fd, dirty_extent_offset + dirty_extent_size, dirty_extent_size);
 		}
 	});
+
+	Cell *cell     = m_extent_ptr[extent_index    ].p_buckets[0].p_cells;
+	Cell *cell_end = m_extent_ptr[extent_index + 1].p_buckets[0].p_cells;
+	size_t toxic_cleared_count = 0;
+	set<BeesHashTable::Cell> seen_it(cell, cell_end);
+	while (cell < cell_end) {
+		if (cell->e_addr & BeesAddress::c_toxic_mask) {
+			++toxic_cleared_count;
+			cell->e_addr &= ~BeesAddress::c_toxic_mask;
+			// Clearing the toxic bit might mean we now have a duplicate.
+			// This could be due to a race between two
+			// inserts, one finds the extent toxic while the
+			// other does not.  That's arguably a bug elsewhere,
+			// but we should rewrite the whole extent lookup/insert
+			// loop, not spend time fixing code that will be
+			// thrown out later anyway.
+			// If there is a cell that is identical to this one
+			// except for the toxic bit, then we don't need this one.
+			if (seen_it.count(*cell)) {
+				cell->e_addr = 0;
+				cell->e_hash = 0;
+			}
+		}
+		++cell;
+	}
+	if (toxic_cleared_count) {
+		BEESLOGDEBUG("Cleared " << toxic_cleared_count << " hashes while fetching hash table extent " << extent_index);
+	}
 }
 
 void

@@ -40,6 +40,9 @@ namespace crucible {
 		/// after the current instance exits.
 		void run() const;
 
+		/// Schedule task to run when no other Task is available.
+		void idle() const;
+
 		/// Schedule Task to run after this Task has run or
 		/// been destroyed.
 		void append(const Task &task) const;
@@ -163,9 +166,9 @@ namespace crucible {
 		/// (it is the ExclusionLock that owns the lock, so it can
 		/// be passed to other Tasks or threads, but this is not
 		/// recommended practice).
-		/// If not successful, current Task is appended to the
+		/// If not successful, the argument Task is appended to the
 		/// task that currently holds the lock.  Current task is
-		/// expected to release any other ExclusionLock
+		/// expected to immediately release any other ExclusionLock
 		/// objects it holds, and exit its Task function.
 		ExclusionLock try_lock(const Task &task);
 

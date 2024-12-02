@@ -214,9 +214,35 @@ BeesTooLong::operator=(const func_type &f)
 	return *this;
 }
 
-void
-bees_readahead(int const fd, const off_t offset, const size_t size)
+static
+bool
+bees_readahead_check(int const fd, off_t const offset, size_t const size)
 {
+	// FIXME: the rest of the code calls this function more often than necessary,
+	// usually back-to-back calls on the same range in a loop.
+	// Simply discard requests that are identical to recent requests from the same thread.
+	const Stat stat_rv(fd);
+	auto tup = make_tuple(offset, size, stat_rv.st_dev, stat_rv.st_ino);
+	static mutex s_recent_mutex;
+	static set<decltype(tup)> s_recent;
+	unique_lock<mutex> lock(s_recent_mutex);
+	if (s_recent.size() > BEES_MAX_EXTENT_REF_COUNT) {
+		s_recent.clear();
+		BEESCOUNT(readahead_clear);
+	}
+	const auto rv = s_recent.insert(tup);
+	// If we recently did this readahead, we're done here
+	if (!rv.second) {
+		BEESCOUNT(readahead_skip);
+	}
+	return rv.second;
+}
+
+static
+void
+bees_readahead_nolock(int const fd, const off_t offset, const size_t size)
+{
+	if (!bees_readahead_check(fd, size, offset)) return;
 	Timer readahead_timer;
 	BEESNOTE("readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
 	BEESTOOLONG("readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
@@ -225,10 +251,8 @@ bees_readahead(int const fd, const off_t offset, const size_t size)
 	DIE_IF_NON_ZERO(readahead(fd, offset, size));
 #else
 	// Make sure this data is in page cache by brute force
-	// This isn't necessary and it might even be slower,
-	// but the btrfs kernel code does readahead with lower ioprio
-	// and might discard the readahead request entirely,
-	// so it's maybe, *maybe*, worth doing both.
+	// The btrfs kernel code does readahead with lower ioprio
+	// and might discard the readahead request entirely.
 	BEESNOTE("emulating readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
 	auto working_size = size;
 	auto working_offset = offset;
@@ -247,6 +271,28 @@ bees_readahead(int const fd, const off_t offset, const size_t size)
 	}
 #endif
 	BEESCOUNTADD(readahead_ms, readahead_timer.age() * 1000);
+}
+
+static mutex s_only_one;
+
+void
+bees_readahead_pair(int fd, off_t offset, size_t size, int fd2, off_t offset2, size_t size2)
+{
+	if (!bees_readahead_check(fd, size, offset) && !bees_readahead_check(fd2, offset2, size2)) return;
+	BEESNOTE("waiting to readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size) << ","
+		<< "\n\t" << name_fd(fd2) << " offset " << to_hex(offset2) << " len " << pretty(size2));
+	unique_lock<mutex> m_lock(s_only_one);
+	bees_readahead_nolock(fd, offset, size);
+	bees_readahead_nolock(fd2, offset2, size2);
+}
+
+void
+bees_readahead(int const fd, const off_t offset, const size_t size)
+{
+	if (!bees_readahead_check(fd, size, offset)) return;
+	BEESNOTE("waiting to readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
+	unique_lock<mutex> m_lock(s_only_one);
+	bees_readahead_nolock(fd, offset, size);
 }
 
 void
@@ -603,7 +649,7 @@ bees_main(int argc, char *argv[])
 	unsigned thread_min = 0;
 	double load_target = 0;
 	bool workaround_btrfs_send = false;
-	BeesRoots::ScanMode root_scan_mode = BeesRoots::SCAN_MODE_INDEPENDENT;
+	BeesRoots::ScanMode root_scan_mode = BeesRoots::SCAN_MODE_EXTENT;
 
 	// Configure getopt_long
 	static const struct option long_options[] = {
@@ -750,6 +796,13 @@ bees_main(int argc, char *argv[])
 
 	// Set root scan mode
 	bc->roots()->set_scan_mode(root_scan_mode);
+
+	if (root_scan_mode == BeesRoots::SCAN_MODE_EXTENT) {
+		MultiLocker::enable_locking(false);
+	} else {
+		// Workaround for a kernel bug that the subvol-based crawlers keep triggering
+		MultiLocker::enable_locking(true);
+	}
 
 	// Start crawlers
 	bc->start();
