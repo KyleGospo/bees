@@ -530,11 +530,6 @@ namespace crucible {
 	size_t
 	TaskMasterState::calculate_thread_count_nolock()
 	{
-		if (m_paused) {
-			// No threads running while paused or cancelled
-			return 0;
-		}
-
 		if (m_load_target == 0) {
 			// No limits, no stats, use configured thread count
 			return m_configured_thread_max;
@@ -645,6 +640,9 @@ namespace crucible {
 		unique_lock<mutex> lock(m_mutex);
 		m_paused = paused;
 		m_condvar.notify_all();
+		if (!m_paused) {
+			start_threads_nolock();
+		}
 		lock.unlock();
 	}
 
