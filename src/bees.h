@@ -78,10 +78,10 @@ const int BEES_PROGRESS_INTERVAL = BEES_STATS_INTERVAL;
 const int BEES_STATUS_INTERVAL = 1;
 
 // Number of file FDs to cache when not in active use
-const size_t BEES_FILE_FD_CACHE_SIZE = 32768;
+const size_t BEES_FILE_FD_CACHE_SIZE = 524288;
 
 // Number of root FDs to cache when not in active use
-const size_t BEES_ROOT_FD_CACHE_SIZE = 4096;
+const size_t BEES_ROOT_FD_CACHE_SIZE = 65536;
 
 // Number of FDs to open (rlimit)
 const size_t BEES_OPEN_FILE_LIMIT = BEES_FILE_FD_CACHE_SIZE + BEES_ROOT_FD_CACHE_SIZE + 100;
@@ -576,7 +576,6 @@ class BeesRoots : public enable_shared_from_this<BeesRoots> {
 	void writeback_thread();
 	uint64_t next_root(uint64_t root = 0);
 	void current_state_set(const BeesCrawlState &bcs);
-	RateEstimator& transid_re();
 	bool crawl_batch(shared_ptr<BeesCrawl> crawl);
 	void clear_caches();
 
@@ -615,6 +614,8 @@ public:
 
 	uint64_t transid_min();
 	uint64_t transid_max();
+
+	void wait_for_transid(const uint64_t count);
 };
 
 struct BeesHash {
@@ -887,6 +888,7 @@ string pretty(double d);
 void bees_readahead(int fd, off_t offset, size_t size);
 void bees_readahead_pair(int fd, off_t offset, size_t size, int fd2, off_t offset2, size_t size2);
 void bees_unreadahead(int fd, off_t offset, size_t size);
+void bees_throttle(double time_used, const char *context);
 string format_time(time_t t);
 
 #endif

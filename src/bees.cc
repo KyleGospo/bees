@@ -305,6 +305,48 @@ bees_unreadahead(int const fd, off_t offset, size_t size)
 	BEESCOUNTADD(readahead_unread_ms, unreadahead_timer.age() * 1000);
 }
 
+static double bees_throttle_factor = 0.0;
+
+void
+bees_throttle(const double time_used, const char *const context)
+{
+	static mutex s_mutex;
+	unique_lock<mutex> throttle_lock(s_mutex);
+	struct time_pair {
+		double time_used = 0;
+		double time_count = 0;
+		double longest_sleep_time = 0;
+	};
+	static map<string, time_pair> s_time_map;
+	auto &this_time = s_time_map[context];
+	auto &this_time_used = this_time.time_used;
+	auto &this_time_count = this_time.time_count;
+	auto &longest_sleep_time = this_time.longest_sleep_time;
+	this_time_used += time_used;
+	++this_time_count;
+	// Keep the timing data fresh
+	static Timer s_fresh_timer;
+	if (s_fresh_timer.age() > 60) {
+		s_fresh_timer.reset();
+		this_time_count *= 0.9;
+		this_time_used *= 0.9;
+	}
+	// Wait for enough data to calculate rates
+	if (this_time_used < 1.0 || this_time_count < 1.0) return;
+	const auto avg_time = this_time_used / this_time_count;
+	const auto sleep_time = min(60.0, bees_throttle_factor * avg_time - time_used);
+	if (sleep_time <= 0) {
+		return;
+	}
+	if (sleep_time > longest_sleep_time) {
+		BEESLOGDEBUG(context << ": throttle delay " << sleep_time << " s, time used " << time_used << " s, avg time " << avg_time << " s");
+		longest_sleep_time = sleep_time;
+	}
+	throttle_lock.unlock();
+	BEESNOTE(context << ": throttle delay " << sleep_time << " s, time used " << time_used << " s, avg time " << avg_time << " s");
+	nanosleep(sleep_time);
+}
+
 thread_local random_device bees_random_device;
 thread_local uniform_int_distribution<default_random_engine::result_type> bees_random_seed_dist(
 	numeric_limits<default_random_engine::result_type>::min(),
@@ -401,6 +443,8 @@ BeesTempFile::resize(off_t offset)
 
 	// Count time spent here
 	BEESCOUNTADD(tmp_resize_ms, resize_timer.age() * 1000);
+
+	bees_throttle(resize_timer.age(), "tmpfile_resize");
 }
 
 void
@@ -536,6 +580,8 @@ BeesTempFile::make_copy(const BeesFileRange &src)
 	}
 	BEESCOUNTADD(tmp_copy_ms, copy_timer.age() * 1000);
 
+	bees_throttle(copy_timer.age(), "tmpfile_copy");
+
 	BEESCOUNT(tmp_copy);
 	return rv;
 }
@@ -670,29 +716,34 @@ bees_main(int argc, char *argv[])
 	BeesRoots::ScanMode root_scan_mode = BeesRoots::SCAN_MODE_EXTENT;
 
 	// Configure getopt_long
+	// Options with no short form
+	enum {
+		BEES_OPT_THROTTLE_FACTOR = 256,
+	};
 	static const struct option long_options[] = {
-		{ "thread-factor",         required_argument, NULL, 'C' },
-		{ "thread-min",            required_argument, NULL, 'G' },
-		{ "strip-paths",           no_argument,       NULL, 'P' },
-		{ "no-timestamps",         no_argument,       NULL, 'T' },
-		{ "workaround-btrfs-send", no_argument,       NULL, 'a' },
-		{ "thread-count",          required_argument, NULL, 'c' },
-		{ "loadavg-target",        required_argument, NULL, 'g' },
-		{ "help",                  no_argument,       NULL, 'h' },
-		{ "scan-mode",             required_argument, NULL, 'm' },
-		{ "absolute-paths",        no_argument,       NULL, 'p' },
-		{ "timestamps",            no_argument,       NULL, 't' },
-		{ "verbose",               required_argument, NULL, 'v' },
-		{ 0, 0, 0, 0 },
+		{ .name = "thread-factor",         .has_arg = required_argument, .val = 'C' },
+		{ .name = "throttle-factor",       .has_arg = required_argument, .val = BEES_OPT_THROTTLE_FACTOR },
+		{ .name = "thread-min",            .has_arg = required_argument, .val = 'G' },
+		{ .name = "strip-paths",           .has_arg = no_argument,       .val = 'P' },
+		{ .name = "no-timestamps",         .has_arg = no_argument,       .val = 'T' },
+		{ .name = "workaround-btrfs-send", .has_arg = no_argument,       .val = 'a' },
+		{ .name = "thread-count",          .has_arg = required_argument, .val = 'c' },
+		{ .name = "loadavg-target",        .has_arg = required_argument, .val = 'g' },
+		{ .name = "help",                  .has_arg = no_argument,       .val = 'h' },
+		{ .name = "scan-mode",             .has_arg = required_argument, .val = 'm' },
+		{ .name = "absolute-paths",        .has_arg = no_argument,       .val = 'p' },
+		{ .name = "timestamps",            .has_arg = no_argument,       .val = 't' },
+		{ .name = "verbose",               .has_arg = required_argument, .val = 'v' },
+		{ 0 },
 	};
 
 	// Build getopt_long's short option list from the long_options table.
 	// While we're at it, make sure we didn't duplicate any options.
 	string getopt_list;
-	set<decltype(option::val)> option_vals;
+	map<decltype(option::val), string> option_vals;
 	for (const struct option *op = long_options; op->val; ++op) {
-		THROW_CHECK1(runtime_error, op->val, !option_vals.count(op->val));
-		option_vals.insert(op->val);
+		const auto ins_rv = option_vals.insert(make_pair(op->val, op->name));
+		THROW_CHECK1(runtime_error, op->val, ins_rv.second);
 		if ((op->val & 0xff) != op->val) {
 			continue;
 		}
@@ -703,21 +754,25 @@ bees_main(int argc, char *argv[])
 	}
 
 	// Parse options
-	int c;
 	while (true) {
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, getopt_list.c_str(), long_options, &option_index);
+		const auto c = getopt_long(argc, argv, getopt_list.c_str(), long_options, &option_index);
 		if (-1 == c) {
 			break;
 		}
 
-		BEESLOGDEBUG("Parsing option '" << static_cast<char>(c) << "'");
+		// getopt_long should have weeded out any invalid options,
+		// so we can go ahead and throw here
+		BEESLOGDEBUG("Parsing option '" << option_vals.at(c) << "'");
 
 		switch (c) {
 
 			case 'C':
 				thread_factor = stod(optarg);
+				break;
+			case BEES_OPT_THROTTLE_FACTOR:
+				bees_throttle_factor = stod(optarg);
 				break;
 			case 'G':
 				thread_min = stoul(optarg);
@@ -759,12 +814,12 @@ bees_main(int argc, char *argv[])
 			case 'h':
 			default:
 				do_cmd_help(argv);
-				return EXIT_FAILURE;
+				return EXIT_SUCCESS;
 		}
 	}
 
 	if (optind + 1 != argc) {
-		BEESLOGERR("Only one filesystem path per bees process");
+		BEESLOGERR("Exactly one filesystem path required");
 		return EXIT_FAILURE;
 	}
 
@@ -803,6 +858,8 @@ bees_main(int argc, char *argv[])
 
 	BEESLOGNOTICE("setting worker thread pool maximum size to " << thread_count);
 	TaskMaster::set_thread_count(thread_count);
+
+	BEESLOGNOTICE("setting throttle factor to " << bees_throttle_factor);
 
 	// Set root path
 	string root_path = argv[optind++];

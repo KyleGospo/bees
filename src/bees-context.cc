@@ -20,7 +20,6 @@
 using namespace crucible;
 using namespace std;
 
-
 BeesFdCache::BeesFdCache(shared_ptr<BeesContext> ctx) :
 	m_ctx(ctx)
 {
@@ -214,6 +213,7 @@ BeesContext::dedup(const BeesRangePair &brp_in)
 {
 	// TOOLONG and NOTE can retroactively fill in the filename details, but LOG can't
 	BEESNOTE("dedup " << brp_in);
+	BEESTRACE("dedup " << brp_in);
 
 	if (is_root_ro(brp_in.second.fid().root())) {
 		// BEESLOGDEBUG("WORKAROUND: dst root " << (brp_in.second.fid().root()) << " is read-only);
@@ -241,27 +241,40 @@ BeesContext::dedup(const BeesRangePair &brp_in)
 	BEESCOUNT(dedup_try);
 
 	BEESNOTE("waiting to dedup " << brp);
-	const auto lock = MultiLocker::get_lock("dedupe");
-
-	Timer dedup_timer;
+	auto lock = MultiLocker::get_lock("dedupe");
 
 	BEESLOGINFO("dedup: src " << pretty(brp.first.size())  << " [" << to_hex(brp.first.begin())  << ".." << to_hex(brp.first.end())  << "] {" << first_addr  << "} " << name_fd(brp.first.fd()) << "\n"
 		 << "       dst " << pretty(brp.second.size()) << " [" << to_hex(brp.second.begin()) << ".." << to_hex(brp.second.end()) << "] {" << second_addr << "} " << name_fd(brp.second.fd()));
 	BEESNOTE("dedup: src " << pretty(brp.first.size())  << " [" << to_hex(brp.first.begin())  << ".." << to_hex(brp.first.end())  << "] {" << first_addr  << "} " << name_fd(brp.first.fd()) << "\n"
 		 << "       dst " << pretty(brp.second.size()) << " [" << to_hex(brp.second.begin()) << ".." << to_hex(brp.second.end()) << "] {" << second_addr << "} " << name_fd(brp.second.fd()));
 
-	const bool rv = btrfs_extent_same(brp.first.fd(), brp.first.begin(), brp.first.size(), brp.second.fd(), brp.second.begin());
-	BEESCOUNTADD(dedup_ms, dedup_timer.age() * 1000);
+	while (true) {
+		try {
+			Timer dedup_timer;
+			const bool rv = btrfs_extent_same(brp.first.fd(), brp.first.begin(), brp.first.size(), brp.second.fd(), brp.second.begin());
+			BEESCOUNTADD(dedup_ms, dedup_timer.age() * 1000);
 
-	if (rv) {
-		BEESCOUNT(dedup_hit);
-		BEESCOUNTADD(dedup_bytes, brp.first.size());
-	} else {
-		BEESCOUNT(dedup_miss);
-		BEESLOGWARN("NO Dedup! " << brp);
+			if (rv) {
+				BEESCOUNT(dedup_hit);
+				BEESCOUNTADD(dedup_bytes, brp.first.size());
+			} else {
+				BEESCOUNT(dedup_miss);
+				BEESLOGWARN("NO Dedup! " << brp);
+			}
+
+			lock.reset();
+			bees_throttle(dedup_timer.age(), "dedup");
+			return rv;
+		} catch (const std::system_error &e) {
+			if (e.code().value() == EAGAIN) {
+				BEESNOTE("dedup waiting for btrfs send on " << brp.second);
+				BEESLOGDEBUG("dedup waiting for btrfs send on " << brp.second);
+				roots()->wait_for_transid(1);
+			} else {
+				throw;
+			}
+		}
 	}
-
-	return rv;
 }
 
 BeesRangePair
@@ -344,6 +357,8 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 	BEESTRACE("scan extent " << e);
 	BEESTRACE("scan bfr " << bfr);
 	BEESCOUNT(scan_extent);
+
+	Timer one_timer;
 
 	// We keep moving this method around
 	auto m_ctx = shared_from_this();
@@ -841,7 +856,8 @@ BeesContext::scan_one_extent(const BeesFileRange &bfr, const Extent &e)
 			<< pretty(e.size()) << " "
 			<< dedupe_list.size() << "d" << copy_list.size() << "c"
 			<< ((bytes_zeroed + BLOCK_SIZE_SUMS - 1) / BLOCK_SIZE_SUMS) << "p"
-			<< (extent_compressed ? "z {" : " {")
+			<< (extent_compressed ? "z " : " ")
+			<< one_timer << "s {"
 			<< to_hex(e.bytenr()) << "+" << to_hex(e.offset()) << "} "
 			<< to_hex(e.begin()) << " [" << bar << "] " << to_hex(e.end())
 			<< ' ' << name_fd(bfr.fd())
@@ -978,9 +994,10 @@ BeesContext::resolve_addr_uncached(BeesAddress addr)
 	Timer resolve_timer;
 
 	struct rusage usage_before;
+	struct rusage usage_after;
 	{
 		BEESNOTE("waiting to resolve addr " << addr << " with LOGICAL_INO");
-		const auto lock = MultiLocker::get_lock("logical_ino");
+		auto lock = MultiLocker::get_lock("logical_ino");
 
 		// Get this thread's system CPU usage
 		DIE_IF_MINUS_ONE(getrusage(RUSAGE_THREAD, &usage_before));
@@ -994,12 +1011,12 @@ BeesContext::resolve_addr_uncached(BeesAddress addr)
 		} else {
 			BEESCOUNT(resolve_fail);
 		}
-		BEESCOUNTADD(resolve_ms, resolve_timer.age() * 1000);
+		DIE_IF_MINUS_ONE(getrusage(RUSAGE_THREAD, &usage_after));
+		const auto resolve_timer_age = resolve_timer.age();
+		BEESCOUNTADD(resolve_ms, resolve_timer_age * 1000);
+		lock.reset();
+		bees_throttle(resolve_timer_age, "resolve_addr");
 	}
-
-	// Again!
-	struct rusage usage_after;
-	DIE_IF_MINUS_ONE(getrusage(RUSAGE_THREAD, &usage_after));
 
 	const double sys_usage_delta =
 		(usage_after.ru_stime.tv_sec + usage_after.ru_stime.tv_usec / 1000000.0) -

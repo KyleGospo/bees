@@ -130,7 +130,7 @@ BeesScanMode::start_scan()
 			st->scan();
 		});
 	}
-	m_scan_task.idle();
+	m_scan_task.run();
 }
 
 bool
@@ -592,7 +592,7 @@ BeesScanModeExtent::create_extent_map(const uint64_t bytenr, const ProgressTrack
 
 	{
 		BEESNOTE("waiting to create extent map for " << to_hex(bytenr) << " with LOGICAL_INO");
-		const auto lock = MultiLocker::get_lock("logical_ino");
+		auto lock = MultiLocker::get_lock("logical_ino");
 
 		BEESNOTE("Resolving bytenr " << to_hex(bytenr) << " refs " << log_ino.m_iors.size());
 		BEESTOOLONG("Resolving bytenr " << to_hex(bytenr) << " refs " << log_ino.m_iors.size());
@@ -605,8 +605,11 @@ BeesScanModeExtent::create_extent_map(const uint64_t bytenr, const ProgressTrack
 		} else {
 			BEESCOUNT(extent_fail);
 		}
+		const auto resolve_age = resolve_timer.age();
 
-		BEESCOUNTADD(extent_ms, resolve_timer.age() * 1000);
+		BEESCOUNTADD(extent_ms, resolve_age * 1000);
+		lock.reset();
+		bees_throttle(resolve_age, "extent_map");
 	}
 
         const size_t rv_count = log_ino.m_iors.size();
@@ -645,7 +648,7 @@ BeesScanModeExtent::create_extent_map(const uint64_t bytenr, const ProgressTrack
 			bedf.objectid(i.m_inum);
 			const auto bti = bedf.at(i.m_offset);
 			if (!bti) {
-				BEESLOGDEBUG("No ref for extent " << to_hex(bytenr) << " at root " << i.m_root << " ino " << i.m_inum << " offset " << to_hex(i.m_offset));
+				// BEESLOGDEBUG("No ref for extent " << to_hex(bytenr) << " at root " << i.m_root << " ino " << i.m_inum << " offset " << to_hex(i.m_offset));
 				BEESCOUNT(extent_ref_missing);
 				return;
 			}
@@ -765,7 +768,7 @@ BeesScanModeExtent::scan()
 
 	// Good to go, start everything running
 	for (const auto &i : task_map_copy) {
-		i.second.idle();
+		i.second.run();
 	}
 }
 
@@ -898,13 +901,25 @@ BeesScanModeExtent::map_next_extent(uint64_t const subvol)
 				<< " time " << crawl_time << " subvol " << subvol);
 		}
 
-		// We did something!  Get in line to run again
+		// We did something!  Get in line to run again (but don't preempt work already queued)
 		Task::current_task().idle();
 		return;
 	}
 
 	// All crawls done
 	BEESCOUNT(crawl_done);
+}
+
+static
+string
+strf_localtime(const time_t &when)
+{
+	struct tm ltm = { 0 };
+	DIE_IF_ZERO(localtime_r(&when, &ltm));
+
+	char buf[100] = { 0 };
+	DIE_IF_ZERO(strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &ltm));
+	return buf;
 }
 
 void
@@ -963,13 +978,15 @@ BeesScanModeExtent::next_transid(const CrawlMap &crawl_map_unused)
 		THROW_CHECK0(runtime_error, offset > 0);
 		THROW_CHECK0(runtime_error, chunk_length > 0);
 		last_bgaddr = offset + chunk_length;
+		// Mixed-bg filesystems have block groups that are data _and_ metadata.
+		// Block groups that are _only_ metadata should be filtered out.
+		if (0 == (bti.chunk_type() & BTRFS_BLOCK_GROUP_DATA)) {
+			continue;
+		}
 		bg_info_map[last_bgaddr] = (bg_info) {
 			.first_bytenr = offset,
 			.first_total = fs_size,
 		};
-		if (bti.chunk_type() & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)) {
-			continue;
-		}
 		fs_size += chunk_length;
 	}
 
@@ -995,6 +1012,18 @@ BeesScanModeExtent::next_transid(const CrawlMap &crawl_map_unused)
 
 	// Report on progress using extent bytenr map
 	Table::Table eta;
+	eta.insert_row(0, vector<Table::Content> {
+		Table::Text("extsz"),
+		Table::Text("datasz"),
+		Table::Text("point"),
+		Table::Text("gen_min"),
+		Table::Text("gen_max"),
+		Table::Text("this cycle start"),
+		Table::Text("ctime"),
+		Table::Text("next cycle ETA"),
+	});
+	const auto dash_fill = Table::Fill('-');
+	eta.insert_row(1, vector<Table::Content>(eta.cols().size(), dash_fill));
 	for (const auto &i : s_magic_crawl_map) {
 		const auto &subvol = i.first;
 		const auto &magic = i.second;
@@ -1033,56 +1062,48 @@ BeesScanModeExtent::next_transid(const CrawlMap &crawl_map_unused)
 			BEESCOUNT(progress_out_of_bg);
 		}
 		const auto bytenr_offset = min(bi_last_bytenr, max(bytenr, bi.first_bytenr)) - bi.first_bytenr + bi.first_total;
-		const auto bytenr_percent = bytenr_offset / (0.01 * fs_size);
+		const auto bytenr_norm = bytenr_offset / double(fs_size);
 		const auto now = time(NULL);
 		const auto time_so_far = now - min(now, this_state.m_started);
+		const string start_stamp = strf_localtime(this_state.m_started);
 		string eta_stamp = "-";
 		string eta_pretty = "-";
 		const auto &deferred_finished = deferred_map.at(subvol);
 		const bool finished = deferred_finished.second;
 		if (finished) {
-			eta_stamp = "finished";
-		} else if (time_so_far > 1 && bytenr_percent > 0) {
-			const time_t eta_duration = time_so_far / (bytenr_percent / 100);
+			// eta_stamp = "idle";
+		} else if (time_so_far > 1 && bytenr_norm > 0.01) {
+			const time_t eta_duration = time_so_far / bytenr_norm;
 			const time_t eta_time = eta_duration + now;
-			struct tm ltm = { 0 };
-			DIE_IF_ZERO(localtime_r(&eta_time, &ltm));
-
-			char buf[1024] = { 0 };
-			DIE_IF_ZERO(strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &ltm));
-			eta_stamp = string(buf);
+			eta_stamp = strf_localtime(eta_time);
 			eta_pretty = pretty_seconds(eta_duration);
 		}
 		const auto &mma = mes.m_map.at(subvol);
 		const auto mma_ratio = mes_sample_size_ok ? (mma.m_bytes / double(mes.m_total)) : 1.0;
-		const auto pos_scaled_text = mes_sample_size_ok ? pretty(bytenr_offset * mma_ratio) : "-";
-		const auto pos_text = Table::Text(pos_scaled_text);
-		const auto pct_text = Table::Text(astringprintf("%.4f%%", bytenr_percent));
+		const auto posn_text = Table::Text(finished ? "idle" : astringprintf("%06d", int(floor(bytenr_norm * 1000000))));
 		const auto size_text = Table::Text( mes_sample_size_ok ? pretty(fs_size * mma_ratio) : "-");
 		eta.insert_row(Table::endpos, vector<Table::Content> {
-			pos_text,
-			size_text,
-			pct_text,
 			Table::Text(magic.m_max_size == numeric_limits<uint64_t>::max() ? "max" : pretty(magic.m_max_size)),
+			size_text,
+			posn_text,
 			Table::Number(this_state.m_min_transid),
 			Table::Number(this_state.m_max_transid),
+			Table::Text(start_stamp),
 			Table::Text(eta_pretty),
 			Table::Text(eta_stamp),
 		});
 		BEESCOUNT(progress_ok);
 	}
-	eta.insert_row(0, vector<Table::Content> {
-		Table::Text("done"),
+	eta.insert_row(Table::endpos, vector<Table::Content> {
+		Table::Text("total"),
 		Table::Text(pretty(fs_size)),
-		Table::Text("%done"),
-		Table::Text("size"),
-		Table::Text("transid"),
+		Table::Text(""),
+		Table::Text("gen_now"),
 		Table::Number(m_roots->transid_max()),
-		Table::Text("todo"),
-		Table::Text("inaccurate ETA"),
+		Table::Text(""),
+		Table::Text(""),
+		Table::Text(""),
 	});
-	const auto dash_fill = Table::Fill('-');
-	eta.insert_row(1, vector<Table::Content>(eta.cols().size(), dash_fill));
 	eta.left("");
 	eta.mid(" ");
 	eta.right("");
@@ -1280,6 +1301,9 @@ BeesRoots::transid_max_nocache()
 	THROW_CHECK1(runtime_error, rv, rv > 0);
 	// transid must be less than max, or we did something very wrong
 	THROW_CHECK1(runtime_error, rv, rv < numeric_limits<uint64_t>::max());
+
+	// Update the rate estimator
+	m_transid_re.update(rv);
 	return rv;
 }
 
@@ -1477,6 +1501,15 @@ BeesRoots::clear_caches()
 }
 
 void
+BeesRoots::wait_for_transid(const uint64_t count)
+{
+	const auto now_transid = transid_max_nocache();
+	const auto target_transid = now_transid + count;
+	BEESLOGDEBUG("Waiting for transid " << target_transid << ", current transid is " << now_transid);
+	m_transid_re.wait_until(target_transid);
+}
+
+void
 BeesRoots::crawl_thread()
 {
 	BEESNOTE("creating crawl task");
@@ -1497,7 +1530,8 @@ BeesRoots::crawl_thread()
 		BEESTRACE("Measure current transid");
 		catch_all([&]() {
 			BEESTRACE("calling transid_max_nocache");
-			m_transid_re.update(transid_max_nocache());
+			// Will update m_transid_re as side effect
+			transid_max_nocache();
 		});
 
 		const auto new_transid = m_transid_re.count();
@@ -1614,7 +1648,7 @@ BeesRoots::insert_new_crawl()
 	lock.unlock();
 
 	// Nothing to crawl?  Seems suspicious...
-	if (m_root_crawl_map.empty()) {
+	if (crawl_map_copy.empty()) {
 		BEESLOGINFO("crawl map is empty!");
 	}
 
@@ -1682,7 +1716,7 @@ BeesRoots::start()
 	m_crawl_thread.exec([&]() {
 		// Measure current transid before creating any crawlers
 		catch_all([&]() {
-			m_transid_re.update(transid_max_nocache());
+			transid_max_nocache();
 		});
 
 		// Make sure we have a full complement of crawlers
@@ -2024,12 +2058,6 @@ Fd
 BeesRoots::open_root_ino(uint64_t root, uint64_t ino)
 {
 	return m_ctx->fd_cache()->open_root_ino(root, ino);
-}
-
-RateEstimator &
-BeesRoots::transid_re()
-{
-	return m_transid_re;
 }
 
 void
