@@ -26,11 +26,7 @@ Here are some numbers to estimate appropriate hash table sizes:
 Notes:
 
  * If the hash table is too large, no extra dedupe efficiency is
-obtained, and the extra space wastes RAM.  If the hash table contains
-more block records than there are blocks in the filesystem, the extra
-space can slow bees down.  A table that is too large prevents obsolete
-data from being evicted, so bees wastes time looking for matching data
-that is no longer present on the filesystem.
+obtained, and the extra space wastes RAM.
 
  * If the hash table is too small, bees extrapolates from matching
 blocks to find matching adjacent blocks in the filesystem that have been
@@ -59,19 +55,19 @@ patterns on dedupe effectiveness without performing deep inspection of
 both the filesystem data and its structure--a task that is as expensive
 as performing the deduplication.
 
-* **Compression** on the filesystem reduces the average extent length
-compared to uncompressed filesystems.  The maximum compressed extent
-length on btrfs is 128KB, while the maximum uncompressed extent length
-is 128MB.  Longer extents decrease the optimum hash table size while
-shorter extents increase the optimum hash table size because the
-probability of a hash table entry being present (i.e. unevicted) in
-each extent is proportional to the extent length.
+* **Compression** in files reduces the average extent length compared
+to uncompressed files.  The maximum compressed extent length on
+btrfs is 128KB, while the maximum uncompressed extent length is 128MB.
+Longer extents decrease the optimum hash table size while shorter extents
+increase the optimum hash table size, because the probability of a hash
+table entry being present (i.e. unevicted) in each extent is proportional
+to the extent length.
 
    As a rule of thumb, the optimal hash table size for a compressed
 filesystem is 2-4x larger than the optimal hash table size for the same
-data on an uncompressed filesystem.  Dedupe efficiency falls dramatically
-with hash tables smaller than 128MB/TB as the average dedupe extent size
-is larger than the largest possible compressed extent size (128KB).
+data on an uncompressed filesystem.  Dedupe efficiency falls rapidly with
+hash tables smaller than 128MB/TB as the average dedupe extent size is
+larger than the largest possible compressed extent size (128KB).
 
 * **Short writes or fragmentation** also shorten the average extent
 length and increase optimum hash table size.  If a database writes to
@@ -115,7 +111,6 @@ Extent scan mode:
  * Works with 4.15 and later kernels.
  * Can estimate progress and provide an ETA.
  * Can optimize scanning order to dedupe large extents first.
- * Cannot avoid modifying read-only subvols.
  * Can keep up with frequent creation and deletion of snapshots.
 
 Subvol scan modes:
@@ -123,8 +118,7 @@ Subvol scan modes:
  * Work with 4.14 and earlier kernels.
  * Cannot estimate or report progress.
  * Cannot optimize scanning order by extent size.
- * Can avoid modifying read-only subvols (for `btrfs send` workaround).
- * Have problems keeping up with snapshots created during a scan.
+ * Have problems keeping up with multiple snapshots created during a scan.
 
 The default scan mode is 4, "extent".
 
@@ -212,7 +206,7 @@ Extent scan mode
 Scan mode 4, "extent", scans the extent tree instead of the subvol trees.
 Extent scan mode reads each extent once, regardless of the number of
 reflinks or snapshots.  It adapts to the creation of new snapshots
-immediately, without having to revisit old data.
+and reflinks immediately, without having to revisit old data.
 
 In the extent scan mode, extents are separated into multiple size tiers
 to prioritize large extents over small ones.  Deduping large extents
@@ -268,17 +262,54 @@ send` in extent scan mode, and restart bees after the `send` is complete.
 Threads and load management
 ---------------------------
 
-By default, bees creates one worker thread for each CPU detected.
-These threads then perform scanning and dedupe operations.  The number of
-worker threads can be set with the [`--thread-count` and `--thread-factor`
-options](options.md).
+By default, bees creates one worker thread for each CPU detected.  These
+threads then perform scanning and dedupe operations.  bees attempts to
+maximize the amount of productive work each thread does, until either the
+threads are all continuously busy, or there is no remaining work to do.
 
-If desired, bees can automatically increase or decrease the number
-of worker threads in response to system load.  This reduces impact on
-the rest of the system by pausing bees when other CPU and IO intensive
-loads are active on the system, and resumes bees when the other loads
-are inactive.  This is configured with the [`--loadavg-target` and
-`--thread-min` options](options.md).
+In many cases it is not desirable to continually run bees at maximum
+performance.  Maximum performance is not necessary if bees can dedupe
+new data faster than it appears on the filesystem.  If it only takes
+bees 10 minutes per day to dedupe all new data on a filesystem, then
+bees doesn't need to run for more than 10 minutes per day.
+
+bees supports a number of options for reducing system load:
+
+ * Run bees for a few hours per day, at an off-peak time (i.e. during
+ a maintenace window), instead of running bees continuously.  Any data
+ added to the filesystem while bees is not running will be scanned when
+ bees restarts.  At the end of the maintenance window, terminate the
+ bees process with SIGTERM to write the hash table and scan position
+ for the next maintenance window.
+
+ * Temporarily pause bees operation by sending the bees process SIGUSR1,
+ and resume operation with SIGUSR2.  This is preferable to freezing
+ and thawing the process, e.g. with freezer cgroups or SIGSTOP/SIGCONT
+ signals, because it allows bees to close open file handles that would
+ otherwise prevent those files from being deleted while bees is frozen.
+
+ * Reduce the number of worker threads with the [`--thread-count` or
+`--thread-factor` options](options.md).  This simply leaves CPU cores
+ idle so that other applications on the host can use them, or to save
+ power.
+
+ * Allow bees to automatically track system load and increase or decrease
+ the number of threads to reach a target system load.  This reduces
+ impact on the rest of the system by pausing bees when other CPU and IO
+ intensive loads are active on the system, and resumes bees when the other
+ loads are inactive.  This is configured with the [`--loadavg-target`
+ and `--thread-min` options](options.md).
+
+ * Allow bees to self-throttle operations that enqueue delayed work
+ within btrfs.  These operations are not well controlled by Linux
+ features such as process priority or IO priority or IO rate-limiting,
+ because the enqueued work is submitted to btrfs several seconds before
+ btrfs performs the work.  By the time btrfs performs the work, it's too
+ late for external throttling to be effective.  The [`--throttle-factor`
+ option](options.md) tracks how long it takes btrfs to complete queued
+ operations, and reduces bees's queued work submission rate to match
+ btrfs's queued work completion rate (or a fraction thereof, to reduce
+ system load).
 
 Log verbosity
 -------------

@@ -47,6 +47,10 @@ namespace crucible {
 		/// been destroyed.
 		void append(const Task &task) const;
 
+		/// Schedule Task to run after this Task has run or
+		/// been destroyed, in Task ID order.
+		void insert(const Task &task) const;
+
 		/// Describe Task as text.
 		string title() const;
 
@@ -172,9 +176,6 @@ namespace crucible {
 		/// objects it holds, and exit its Task function.
 		ExclusionLock try_lock(const Task &task);
 
-		/// Execute Task when Exclusion is unlocked (possibly
-		/// immediately).
-		void insert_task(const Task &t);
 	};
 
 	/// Wrapper around pthread_setname_np which handles length limits

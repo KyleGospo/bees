@@ -76,12 +76,23 @@ namespace crucible {
 		/// Tasks to be executed after the current task is executed
 		list<TaskStatePtr>			m_post_exec_queue;
 
-		/// Set by run() and append().  Cleared by exec().
+		/// Set by run(), append(), and insert().  Cleared by exec().
 		bool					m_run_now = false;
+
+		/// Set by insert().  Cleared by exec() and destructor.
+		bool					m_sort_queue = false;
 
 		/// Set when task starts execution by exec().
 		/// Cleared when exec() ends.
 		bool					m_is_running = false;
+
+		/// Set when task is queued while already running.
+		/// Cleared when task is requeued.
+		bool					m_run_again = false;
+
+		/// Set when task is queued as idle task while already running.
+		/// Cleared when task is queued as non-idle task.
+		bool					m_idle = false;
 
 		/// Sequential identifier for next task
 		static atomic<TaskId>			s_next_id;
@@ -107,7 +118,7 @@ namespace crucible {
 		static void clear_queue(TaskQueue &tq);
 
 		/// Rescue any TaskQueue, not just this one.
-		static void rescue_queue(TaskQueue &tq);
+		static void rescue_queue(TaskQueue &tq, const bool sort_queue);
 
 		TaskState &operator=(const TaskState &) = delete;
 		TaskState(const TaskState &) = delete;
@@ -141,6 +152,10 @@ namespace crucible {
 		/// Queue task to execute after current task finishes executing
 		/// or is destroyed.
 		void append(const TaskStatePtr &task);
+
+		/// Queue task to execute after current task finishes executing
+		/// or is destroyed, in task ID order.
+		void insert(const TaskStatePtr &task);
 
 		/// How masy Tasks are there?  Good for catching leaks
 		static size_t instance_count();
@@ -219,16 +234,21 @@ namespace crucible {
 	static auto s_tms = make_shared<TaskMasterState>();
 
 	void
-	TaskState::rescue_queue(TaskQueue &queue)
+	TaskState::rescue_queue(TaskQueue &queue, const bool sort_queue)
 	{
 		if (queue.empty()) {
 			return;
 		}
-		const auto tlcc = tl_current_consumer;
+		const auto &tlcc = tl_current_consumer;
 		if (tlcc) {
 			// We are executing under a TaskConsumer, splice our post-exec queue at front.
 			// No locks needed because we are using only thread-local objects.
 			tlcc->m_local_queue.splice(tlcc->m_local_queue.begin(), queue);
+			if (sort_queue) {
+				tlcc->m_local_queue.sort([&](const TaskStatePtr &a, const TaskStatePtr &b) {
+					return a->m_id < b->m_id;
+				});
+			}
 		} else {
 			// We are not executing under a TaskConsumer.
 			// If there is only one task, then just insert it at the front of the queue.
@@ -239,6 +259,8 @@ namespace crucible {
 				// then push it to the front of the global queue using normal locking methods.
 				TaskStatePtr rescue_task(make_shared<TaskState>("rescue_task", [](){}));
 				swap(rescue_task->m_post_exec_queue, queue);
+				// Do the sort--once--when a new Consumer has picked up the Task
+				rescue_task->m_sort_queue = sort_queue;
 				TaskQueue tq_one { rescue_task };
 				TaskMasterState::push_front(tq_one);
 			}
@@ -251,7 +273,8 @@ namespace crucible {
 		--s_instance_count;
 		unique_lock<mutex> lock(m_mutex);
 		// If any dependent Tasks were appended since the last exec, run them now
-		TaskState::rescue_queue(m_post_exec_queue);
+		TaskState::rescue_queue(m_post_exec_queue, m_sort_queue);
+		// No need to clear m_sort_queue here, it won't exist soon
 	}
 
 	TaskState::TaskState(string title, function<void()> exec_fn) :
@@ -310,6 +333,24 @@ namespace crucible {
 			task->m_run_now = true;
 			append_nolock(task);
 		}
+		task->m_idle = false;
+	}
+
+	void
+	TaskState::insert(const TaskStatePtr &task)
+	{
+		THROW_CHECK0(invalid_argument, task);
+		THROW_CHECK2(invalid_argument, m_id, task->m_id, m_id != task->m_id);
+		PairLock lock(m_mutex, task->m_mutex);
+		if (!task->m_run_now) {
+			task->m_run_now = true;
+			// Move the task and its post-exec queue to follow this task,
+			// and request a sort of the flattened list.
+			m_sort_queue = true;
+			m_post_exec_queue.push_back(task);
+			m_post_exec_queue.splice(m_post_exec_queue.end(), task->m_post_exec_queue);
+		}
+		task->m_idle = false;
 	}
 
 	void
@@ -320,7 +361,7 @@ namespace crucible {
 
 		unique_lock<mutex> lock(m_mutex);
 		if (m_is_running) {
-			append_nolock(shared_from_this());
+			m_run_again = true;
 			return;
 		} else {
 			m_run_now = false;
@@ -344,8 +385,20 @@ namespace crucible {
 		swap(this_task, tl_current_task);
 		m_is_running = false;
 
+		if (m_run_again) {
+			m_run_again = false;
+			if (m_idle) {
+				// All the way back to the end of the line
+				TaskMasterState::push_back_idle(shared_from_this());
+			} else {
+				// Insert after any dependents waiting for this Task
+				m_post_exec_queue.push_back(shared_from_this());
+			}
+		}
+
 		// Splice task post_exec queue at front of local queue
-		TaskState::rescue_queue(m_post_exec_queue);
+		TaskState::rescue_queue(m_post_exec_queue, m_sort_queue);
+		m_sort_queue = false;
 	}
 
 	string
@@ -365,22 +418,32 @@ namespace crucible {
 	TaskState::run()
 	{
 		unique_lock<mutex> lock(m_mutex);
+		m_idle = false;
 		if (m_run_now) {
 			return;
 		}
 		m_run_now = true;
-		TaskMasterState::push_back(shared_from_this());
+		if (m_is_running) {
+			m_run_again = true;
+		} else {
+			TaskMasterState::push_back(shared_from_this());
+		}
 	}
 
 	void
 	TaskState::idle()
 	{
 		unique_lock<mutex> lock(m_mutex);
+		m_idle = true;
 		if (m_run_now) {
 			return;
 		}
 		m_run_now = true;
-		TaskMasterState::push_back_idle(shared_from_this());
+		if (m_is_running) {
+			m_run_again = true;
+		} else {
+			TaskMasterState::push_back_idle(shared_from_this());
+		}
 	}
 
 	TaskMasterState::TaskMasterState(size_t thread_max) :
@@ -740,6 +803,14 @@ namespace crucible {
 		m_task_state->append(that.m_task_state);
 	}
 
+	void
+	Task::insert(const Task &that) const
+	{
+		THROW_CHECK0(runtime_error, m_task_state);
+		THROW_CHECK0(runtime_error, that);
+		m_task_state->insert(that.m_task_state);
+	}
+
 	Task
 	Task::current_task()
 	{
@@ -854,11 +925,13 @@ namespace crucible {
 		swap(this_consumer, tl_current_consumer);
 		assert(!tl_current_consumer);
 
-		// Release lock to rescue queue (may attempt to queue a new task at TaskMaster).
-		// rescue_queue normally sends tasks to the local queue of the current TaskConsumer thread,
-		// but we just disconnected ourselves from that.
+		// Release lock to rescue queue (may attempt to queue a
+		// new task at TaskMaster).  rescue_queue normally sends
+		// tasks to the local queue of the current TaskConsumer
+		// thread, but we just disconnected ourselves from that.
+		// No sorting here because this is not a TaskState.
 		lock.unlock();
-		TaskState::rescue_queue(m_local_queue);
+		TaskState::rescue_queue(m_local_queue, false);
 
 		// Hold lock so we can erase ourselves
 		lock.lock();
@@ -936,21 +1009,6 @@ namespace crucible {
 		m_owner.reset();
 	}
 
-	void
-	Exclusion::insert_task(const Task &task)
-	{
-		unique_lock<mutex> lock(m_mutex);
-		const auto sp = m_owner.lock();
-		lock.unlock();
-		if (sp) {
-			// If Exclusion is locked then queue task for release;
-			sp->append(task);
-		} else {
-			// otherwise, run the inserted task immediately
-			task.run();
-		}
-	}
-
 	ExclusionLock
 	Exclusion::try_lock(const Task &task)
 	{
@@ -958,7 +1016,7 @@ namespace crucible {
 		const auto sp = m_owner.lock();
 		if (sp) {
 			if (task) {
-				sp->append(task);
+				sp->insert(task);
 			}
 			return ExclusionLock();
 		} else {
