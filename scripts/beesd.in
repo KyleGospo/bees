@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# if not called from systemd try to replicate mount unsharing on ctrl+c
+# see: https://github.com/Zygo/bees/issues/281
+if [ -z "${SYSTEMD_EXEC_PID}" -a -z "${UNSHARE_DONE}" ]; then
+        UNSHARE_DONE=true
+        export UNSHARE_DONE
+        exec unshare -m --propagation private -- "$0" "$@"
+fi
+
 ## Helpful functions
 INFO(){ echo "INFO:" "$@"; }
 ERRO(){ echo "ERROR:" "$@"; exit 1; }
@@ -108,13 +116,11 @@ mkdir -p "$WORK_DIR" || exit 1
 INFO "MOUNT DIR: $MNT_DIR"
 mkdir -p "$MNT_DIR" || exit 1
 
-mount --make-private -osubvolid=5 /dev/disk/by-uuid/$UUID "$MNT_DIR" || exit 1
+mount --make-private -osubvolid=5,nodev,noexec /dev/disk/by-uuid/$UUID "$MNT_DIR" || exit 1
 
 if [ ! -d "$BEESHOME" ]; then
     INFO "Create subvol $BEESHOME for store bees data"
     btrfs sub cre "$BEESHOME"
-else
-    btrfs sub show "$BEESHOME" &> /dev/null || ERRO "$BEESHOME MUST BE A SUBVOL!"
 fi
 
 # Check DB size
