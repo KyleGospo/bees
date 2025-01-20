@@ -538,8 +538,9 @@ should_throttle()
 	// If there's not too many entries in the queue, restart the scan task
 	const auto instance_count = Task::instance_count();
 	const auto instance_limit = BEES_MAX_EXTENT_REF_COUNT;
-	const bool queue_empty = s_throttled && instance_count < instance_limit;
-	const bool queue_full = !s_throttled && instance_count > instance_limit;
+	// Add some hysteresis so that we aren't constantly flipping throttle on and off
+	const bool queue_empty = s_throttled && instance_count < instance_limit * .90;
+	const bool queue_full = !s_throttled && instance_count > instance_limit * .99;
 	if (queue_full) {
 		BEESLOGDEBUG("Throttling crawl at " << instance_count << " tasks");
 		s_throttled = true;
@@ -761,8 +762,6 @@ BeesScanModeExtent::scan()
 {
 	BEESTRACE("bsm scan");
 
-	if (should_throttle()) return;
-
 	unique_lock<mutex> lock(m_mutex);
 	const auto task_map_copy = m_task_map;
 	lock.unlock();
@@ -777,8 +776,6 @@ void
 BeesScanModeExtent::map_next_extent(uint64_t const subvol)
 {
 	BEESTRACE("map_next_extent " << subvol);
-
-	if (should_throttle()) return;
 
 	size_t discard_count = 0;
 	size_t gen_low_count = 0;
@@ -902,8 +899,10 @@ BeesScanModeExtent::map_next_extent(uint64_t const subvol)
 				<< " time " << crawl_time << " subvol " << subvol);
 		}
 
-		// We did something!  Get in line to run again
-		Task::current_task().idle();
+		// We did something!  Get in line to run again...unless we're throttled
+		if (!should_throttle()) {
+			Task::current_task().idle();
+		}
 		return;
 	}
 
@@ -1775,6 +1774,7 @@ bees_openat(int const parent_fd, const char *const pathname, uint64_t const flag
 		};
 		const auto rv = openat2(parent_fd, pathname, &how, sizeof(open_how));
 		if (rv == -1 && errno == ENOSYS) {
+			BEESLOGWARN("openat2 returns ENOSYS, falling back to openat");
 			can_openat2 = false;
 		} else {
 			return Fd(rv);
