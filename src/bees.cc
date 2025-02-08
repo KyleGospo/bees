@@ -246,10 +246,6 @@ bees_readahead_nolock(int const fd, const off_t offset, const size_t size)
 	Timer readahead_timer;
 	BEESNOTE("readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
 	BEESTOOLONG("readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
-#if 0
-	// In the kernel, readahead() is identical to posix_fadvise(..., POSIX_FADV_DONTNEED)
-	DIE_IF_NON_ZERO(readahead(fd, offset, size));
-#else
 	// Make sure this data is in page cache by brute force
 	// The btrfs kernel code does readahead with lower ioprio
 	// and might discard the readahead request entirely.
@@ -263,13 +259,16 @@ bees_readahead_nolock(int const fd, const off_t offset, const size_t size)
 		// Ignore errors and short reads.  It turns out our size
 		// parameter isn't all that accurate, so we can't use
 		// the pread_or_die template.
-		(void)!pread(fd, dummy, this_read_size, working_offset);
-		BEESCOUNT(readahead_count);
-		BEESCOUNTADD(readahead_bytes, this_read_size);
+		const auto pr_rv = pread(fd, dummy, this_read_size, working_offset);
+		if (pr_rv >= 0) {
+			BEESCOUNT(readahead_count);
+			BEESCOUNTADD(readahead_bytes, pr_rv);
+		} else {
+			BEESCOUNT(readahead_fail);
+		}
 		working_offset += this_read_size;
 		working_size -= this_read_size;
 	}
-#endif
 	BEESCOUNTADD(readahead_ms, readahead_timer.age() * 1000);
 }
 
@@ -704,9 +703,8 @@ bees_main(int argc, char *argv[])
 	shared_ptr<BeesContext> bc = make_shared<BeesContext>();
 	BEESLOGDEBUG("context constructed");
 
-	string cwd(readlink_or_die("/proc/self/cwd"));
-
 	// Defaults
+	bool use_relative_paths = false;
 	bool chatter_prefix_timestamp = true;
 	double thread_factor = 0;
 	unsigned thread_count = 0;
@@ -778,7 +776,7 @@ bees_main(int argc, char *argv[])
 				thread_min = stoul(optarg);
 				break;
 			case 'P':
-				crucible::set_relative_path(cwd);
+				use_relative_paths = true;
 				break;
 			case 'T':
 				chatter_prefix_timestamp = false;
@@ -796,7 +794,7 @@ bees_main(int argc, char *argv[])
 				root_scan_mode = static_cast<BeesRoots::ScanMode>(stoul(optarg));
 				break;
 			case 'p':
-				crucible::set_relative_path("");
+				use_relative_paths = false;
 				break;
 			case 't':
 				chatter_prefix_timestamp = true;
@@ -866,18 +864,19 @@ bees_main(int argc, char *argv[])
 	BEESLOGNOTICE("setting root path to '" << root_path << "'");
 	bc->set_root_path(root_path);
 
+	// Set path prefix
+	if (use_relative_paths) {
+		crucible::set_relative_path(name_fd(bc->root_fd()));
+	}
+
 	// Workaround for btrfs send
 	bc->roots()->set_workaround_btrfs_send(workaround_btrfs_send);
 
 	// Set root scan mode
 	bc->roots()->set_scan_mode(root_scan_mode);
 
-	if (root_scan_mode == BeesRoots::SCAN_MODE_EXTENT) {
-		MultiLocker::enable_locking(false);
-	} else {
-		// Workaround for a kernel bug that the subvol-based crawlers keep triggering
-		MultiLocker::enable_locking(true);
-	}
+	// Workaround for the logical-ino-vs-clone kernel bug
+	MultiLocker::enable_locking(true);
 
 	// Start crawlers
 	bc->start();

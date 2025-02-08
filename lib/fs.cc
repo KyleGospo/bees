@@ -757,6 +757,7 @@ namespace crucible {
 	thread_local size_t BtrfsIoctlSearchKey::s_calls = 0;
 	thread_local size_t BtrfsIoctlSearchKey::s_loops = 0;
 	thread_local size_t BtrfsIoctlSearchKey::s_loops_empty = 0;
+	thread_local shared_ptr<ostream> BtrfsIoctlSearchKey::s_debug_ostream;
 
 	bool
 	BtrfsIoctlSearchKey::do_ioctl_nothrow(int fd)
@@ -776,6 +777,9 @@ namespace crucible {
 			ioctl_ptr = ioctl_arg.get<btrfs_ioctl_search_args_v2>();
 			ioctl_ptr->key = static_cast<const btrfs_ioctl_search_key&>(*this);
 			ioctl_ptr->buf_size = buf_size;
+			if (s_debug_ostream) {
+				(*s_debug_ostream) << "bisk " << (ioctl_ptr->key) << "\n";
+			}
 			// Don't bother supporting V1.  Kernels that old have other problems.
 			int rv = ioctl(fd, BTRFS_IOC_TREE_SEARCH_V2, ioctl_arg.data());
 			++s_calls;
@@ -879,6 +883,26 @@ namespace crucible {
 				assert(min_offset == 0);
 			}
 		}
+	}
+
+	string
+	btrfs_chunk_type_ntoa(uint64_t type)
+	{
+		static const bits_ntoa_table table[] = {
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_DATA),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_METADATA),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_SYSTEM),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_DUP),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID0),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID1),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID10),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID1C3),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID1C4),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID5),
+			NTOA_TABLE_ENTRY_BITS(BTRFS_BLOCK_GROUP_RAID6),
+			NTOA_TABLE_ENTRY_END()
+		};
+		return bits_ntoa(type, table);
 	}
 
 	string
@@ -1138,11 +1162,17 @@ namespace crucible {
 	{
 	}
 
-	void
-	BtrfsIoctlFsInfoArgs::do_ioctl(int fd)
+	bool
+	BtrfsIoctlFsInfoArgs::do_ioctl_nothrow(int const fd)
 	{
 		btrfs_ioctl_fs_info_args_v3 *p = static_cast<btrfs_ioctl_fs_info_args_v3 *>(this);
-		if (ioctl(fd, BTRFS_IOC_FS_INFO, p)) {
+		return 0 == ioctl(fd, BTRFS_IOC_FS_INFO, p);
+	}
+
+	void
+	BtrfsIoctlFsInfoArgs::do_ioctl(int const fd)
+	{
+		if (!do_ioctl_nothrow(fd)) {
 			THROW_ERRNO("BTRFS_IOC_FS_INFO: fd " << fd);
 		}
 	}
@@ -1157,6 +1187,13 @@ namespace crucible {
 	BtrfsIoctlFsInfoArgs::csum_size() const
 	{
 		return this->btrfs_ioctl_fs_info_args_v3::csum_size;
+	}
+
+	vector<uint8_t>
+	BtrfsIoctlFsInfoArgs::fsid() const
+	{
+		const auto begin = btrfs_ioctl_fs_info_args_v3::fsid;
+		return vector<uint8_t>(begin, begin + BTRFS_FSID_SIZE);
 	}
 
 	uint64_t

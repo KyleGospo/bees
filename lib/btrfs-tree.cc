@@ -5,6 +5,12 @@
 #include "crucible/hexdump.h"
 #include "crucible/seeker.h"
 
+#define CRUCIBLE_BTRFS_TREE_DEBUG(x) do { \
+	if (BtrfsIoctlSearchKey::s_debug_ostream) { \
+		(*BtrfsIoctlSearchKey::s_debug_ostream) << x; \
+	} \
+} while (false)
+
 namespace crucible {
 	using namespace std;
 
@@ -355,6 +361,7 @@ namespace crucible {
 	BtrfsTreeItem
 	BtrfsTreeFetcher::at(uint64_t logical)
 	{
+		CRUCIBLE_BTRFS_TREE_DEBUG("at " << logical);
 		BtrfsIoctlSearchKey &sk = m_sk;
 		fill_sk(sk, logical);
 		// Exact match, should return 0 or 1 items
@@ -397,16 +404,17 @@ namespace crucible {
 	BtrfsTreeFetcher::rlower_bound(uint64_t logical)
 	{
 	#if 0
-	#define BTFRLB_DEBUG(x) do { cerr << x; } while (false)
+		static bool btfrlb_debug = getenv("BTFLRB_DEBUG");
+	#define BTFRLB_DEBUG(x) do { if (btfrlb_debug) cerr << x; } while (false)
 	#else
-	#define BTFRLB_DEBUG(x) do { } while (false)
+	#define BTFRLB_DEBUG(x) CRUCIBLE_BTRFS_TREE_DEBUG(x)
 	#endif
 		BtrfsTreeItem closest_item;
 		uint64_t closest_logical = 0;
 		BtrfsIoctlSearchKey &sk = m_sk;
 		size_t loops = 0;
-		BTFRLB_DEBUG("rlower_bound: " << to_hex(logical) << endl);
-		seek_backward(scale_logical(logical), [&](uint64_t lower_bound, uint64_t upper_bound) {
+		BTFRLB_DEBUG("rlower_bound: " << to_hex(logical) << " in tree " << tree() << endl);
+		seek_backward(scale_logical(logical), [&](uint64_t const lower_bound, uint64_t const upper_bound) {
 			++loops;
 			fill_sk(sk, unscale_logical(min(scaled_max_logical(), lower_bound)));
 			set<uint64_t> rv;
@@ -416,29 +424,31 @@ namespace crucible {
 				BTFRLB_DEBUG("fetch: loop " << loops << " lower_bound..upper_bound " << to_hex(lower_bound) << ".." << to_hex(upper_bound));
 				for (auto &i : sk.m_result) {
 					next_sk(sk, i);
-					const auto this_logical = hdr_logical(i);
-					const auto scaled_hdr_logical = scale_logical(this_logical);
-					BTFRLB_DEBUG(" " << to_hex(scaled_hdr_logical));
-					if (hdr_match(i)) {
-						if (this_logical <= logical && this_logical > closest_logical) {
-							closest_logical = this_logical;
-							closest_item = i;
-						}
-						BTFRLB_DEBUG("(match)");
-						rv.insert(scaled_hdr_logical);
-					}
-					if (scaled_hdr_logical > upper_bound || hdr_stop(i)) {
-						if (scaled_hdr_logical >= upper_bound) {
-							BTFRLB_DEBUG("(" << to_hex(scaled_hdr_logical) << " >= " << to_hex(upper_bound) << ")");
-						}
-						if (hdr_stop(i)) {
-							rv.insert(numeric_limits<uint64_t>::max());
-							BTFRLB_DEBUG("(stop)");
-						}
+					// If hdr_stop or !hdr_match, don't inspect the item
+					if (hdr_stop(i)) {
+						rv.insert(numeric_limits<uint64_t>::max());
+						BTFRLB_DEBUG("(stop)");
 						break;
-					} else {
-						BTFRLB_DEBUG("(cont'd)");
 					}
+					if (!hdr_match(i)) {
+						BTFRLB_DEBUG("(no match)");
+						continue;
+					}
+					const auto this_logical = hdr_logical(i);
+					BTFRLB_DEBUG(" " << to_hex(this_logical) << " " << i);
+					const auto scaled_hdr_logical = scale_logical(this_logical);
+					BTFRLB_DEBUG(" " << "(match)");
+					if (this_logical <= logical && this_logical > closest_logical) {
+						closest_logical = this_logical;
+						closest_item = i;
+						BTFRLB_DEBUG("(closest)");
+					}
+					rv.insert(scaled_hdr_logical);
+					if (scaled_hdr_logical > upper_bound) {
+						BTFRLB_DEBUG("(" << to_hex(scaled_hdr_logical) << " >= " << to_hex(upper_bound) << ")");
+						break;
+					}
+					BTFRLB_DEBUG("(cont'd)");
 				}
 				BTFRLB_DEBUG(endl);
 				// We might get a search result that contains only non-matching items.
@@ -474,6 +484,7 @@ namespace crucible {
 	BtrfsTreeItem
 	BtrfsTreeFetcher::next(uint64_t logical)
 	{
+		CRUCIBLE_BTRFS_TREE_DEBUG("next " << logical);
 		const auto scaled_logical = scale_logical(logical);
 		if (scaled_logical + 1 > scaled_max_logical()) {
 			return BtrfsTreeItem();
@@ -484,6 +495,7 @@ namespace crucible {
 	BtrfsTreeItem
 	BtrfsTreeFetcher::prev(uint64_t logical)
 	{
+		CRUCIBLE_BTRFS_TREE_DEBUG("prev " << logical);
 		const auto scaled_logical = scale_logical(logical);
 		if (scaled_logical < 1) {
 			return BtrfsTreeItem();
@@ -568,9 +580,10 @@ namespace crucible {
 	BtrfsCsumTreeFetcher::get_sums(uint64_t const logical, size_t count, function<void(uint64_t logical, const uint8_t *buf, size_t bytes)> output)
 	{
 	#if 0
-	#define BCTFGS_DEBUG(x) do { cerr << x; } while (false)
+		static bool bctfgs_debug = getenv("BCTFGS_DEBUG");
+	#define BCTFGS_DEBUG(x) do { if (bctfgs_debug) cerr << x; } while (false)
 	#else
-	#define BCTFGS_DEBUG(x) do { } while (false)
+	#define BCTFGS_DEBUG(x) CRUCIBLE_BTRFS_TREE_DEBUG(x)
 	#endif
 		const uint64_t logical_end = logical + count * block_size();
 		BtrfsTreeItem bti = rlower_bound(logical);
@@ -662,14 +675,6 @@ namespace crucible {
 		type(BTRFS_EXTENT_DATA_KEY);
 	}
 
-	BtrfsFsTreeFetcher::BtrfsFsTreeFetcher(const Fd &new_fd, uint64_t subvol) :
-		BtrfsTreeObjectFetcher(new_fd)
-	{
-		tree(subvol);
-		type(BTRFS_EXTENT_DATA_KEY);
-		scale_size(1);
-	}
-
 	BtrfsInodeFetcher::BtrfsInodeFetcher(const Fd &fd) :
 		BtrfsTreeObjectFetcher(fd)
 	{
@@ -693,18 +698,86 @@ namespace crucible {
 		BtrfsTreeObjectFetcher(fd)
 	{
 		tree(BTRFS_ROOT_TREE_OBJECTID);
-		type(BTRFS_ROOT_ITEM_KEY);
 		scale_size(1);
 	}
 
 	BtrfsTreeItem
-	BtrfsRootFetcher::root(uint64_t subvol)
+	BtrfsRootFetcher::root(const uint64_t subvol)
 	{
+		const auto my_type = BTRFS_ROOT_ITEM_KEY;
+		type(my_type);
 		const auto item = at(subvol);
 		if (!!item) {
 			THROW_CHECK2(runtime_error, item.objectid(), subvol, subvol == item.objectid());
-			THROW_CHECK2(runtime_error, item.type(), BTRFS_ROOT_ITEM_KEY, item.type() == BTRFS_ROOT_ITEM_KEY);
+			THROW_CHECK2(runtime_error, item.type(), my_type, item.type() == my_type);
 		}
 		return item;
+	}
+
+	BtrfsTreeItem
+	BtrfsRootFetcher::root_backref(const uint64_t subvol)
+	{
+		const auto my_type = BTRFS_ROOT_BACKREF_KEY;
+		type(my_type);
+		const auto item = at(subvol);
+		if (!!item) {
+			THROW_CHECK2(runtime_error, item.objectid(), subvol, subvol == item.objectid());
+			THROW_CHECK2(runtime_error, item.type(), my_type, item.type() == my_type);
+		}
+		return item;
+	}
+
+	BtrfsDataExtentTreeFetcher::BtrfsDataExtentTreeFetcher(const Fd &fd) :
+		BtrfsExtentItemFetcher(fd),
+		m_chunk_tree(fd)
+	{
+		tree(BTRFS_EXTENT_TREE_OBJECTID);
+		type(BTRFS_EXTENT_ITEM_KEY);
+		m_chunk_tree.tree(BTRFS_CHUNK_TREE_OBJECTID);
+		m_chunk_tree.type(BTRFS_CHUNK_ITEM_KEY);
+		m_chunk_tree.objectid(BTRFS_FIRST_CHUNK_TREE_OBJECTID);
+	}
+
+	void
+	BtrfsDataExtentTreeFetcher::next_sk(BtrfsIoctlSearchKey &key, const BtrfsIoctlSearchHeader &hdr)
+	{
+		key.min_type = key.max_type = type();
+		key.max_objectid = key.max_offset = numeric_limits<uint64_t>::max();
+		key.min_offset = 0;
+		key.min_objectid = hdr.objectid;
+		const auto step = scale_size();
+		if (key.min_objectid < numeric_limits<uint64_t>::max() - step) {
+			key.min_objectid += step;
+		} else {
+			key.min_objectid = numeric_limits<uint64_t>::max();
+		}
+		// If we're still in our current block group, check here
+		if (!!m_current_bg) {
+			const auto bg_begin = m_current_bg.offset();
+			const auto bg_end = bg_begin + m_current_bg.chunk_length();
+			// If we are still in our current block group, return early
+			if (key.min_objectid >= bg_begin && key.min_objectid < bg_end) return;
+		}
+		// We don't have a current block group or we're out of range
+		// Find the chunk that this bytenr belongs to
+		m_current_bg = m_chunk_tree.rlower_bound(key.min_objectid);
+		// Make sure it's a data block group
+		while (!!m_current_bg) {
+			// Data block group, stop here
+			if (m_current_bg.chunk_type() & BTRFS_BLOCK_GROUP_DATA) break;
+			// Not a data block group, skip to end
+			key.min_objectid = m_current_bg.offset() + m_current_bg.chunk_length();
+			m_current_bg = m_chunk_tree.lower_bound(key.min_objectid);
+		}
+		if (!m_current_bg) {
+			// Ran out of data block groups, stop here
+			return;
+		}
+		// Check to see if bytenr is in the current data block group
+		const auto bg_begin = m_current_bg.offset();
+		if (key.min_objectid < bg_begin) {
+			// Move forward to start of data block group
+			key.min_objectid = bg_begin;
+		}
 	}
 }

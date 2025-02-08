@@ -201,11 +201,13 @@ namespace crucible {
 		static thread_local size_t s_calls;
 		static thread_local size_t s_loops;
 		static thread_local size_t s_loops_empty;
+		static thread_local shared_ptr<ostream> s_debug_ostream;
 	};
 
 	ostream & operator<<(ostream &os, const btrfs_ioctl_search_key &key);
 	ostream & operator<<(ostream &os, const BtrfsIoctlSearchKey &key);
 
+	string btrfs_chunk_type_ntoa(uint64_t type);
 	string btrfs_search_type_ntoa(unsigned type);
 	string btrfs_search_objectid_ntoa(uint64_t objectid);
 	string btrfs_compress_type_ntoa(uint8_t type);
@@ -246,9 +248,11 @@ namespace crucible {
 	struct BtrfsIoctlFsInfoArgs : public btrfs_ioctl_fs_info_args_v3 {
 		BtrfsIoctlFsInfoArgs();
 		void do_ioctl(int fd);
+		bool do_ioctl_nothrow(int fd);
 		uint16_t csum_type() const;
 		uint16_t csum_size() const;
 		uint64_t generation() const;
+		vector<uint8_t> fsid() const;
 	};
 
 	ostream & operator<<(ostream &os, const BtrfsIoctlFsInfoArgs &a);
