@@ -948,22 +948,24 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 		const auto search_calls = BtrfsIoctlSearchKey::s_calls - init_s_calls;
 		const auto search_loops = BtrfsIoctlSearchKey::s_loops - init_s_loops;
 		if (crawl_time.age() > 1) {
-			BEESLOGDEBUG(
-				"loop_count " << loop_count
-				<< " size_low_count " << size_low_count
-				<< " size_high_count " << size_high_count
-				<< " gen_low_count " << gen_low_count
-				<< " gen_high_count " << gen_high_count
-				<< " search_calls " << search_calls
-				<< " search_loops " << search_loops
-				<< " skips " << skip_count
-				<< " flops " << flop_count
-				<< " time " << crawl_time
-				<< " subvol " << m_subvol
-				<< " search/loop " << pretty(search_calls / loop_count)
-				<< " skip/loop " << (100 * skip_count / loop_count) << "%"
-				<< " flop/loop " << (100 * flop_count / loop_count) << "%"
-			);
+			if (loop_count) {
+				BEESLOGDEBUG(
+					"loop_count " << loop_count
+					<< " size_low_count " << size_low_count
+					<< " size_high_count " << size_high_count
+					<< " gen_low_count " << gen_low_count
+					<< " gen_high_count " << gen_high_count
+					<< " search_calls " << search_calls
+					<< " search_loops " << search_loops
+					<< " skips " << skip_count
+					<< " flops " << flop_count
+					<< " time " << crawl_time
+					<< " subvol " << m_subvol
+					<< " search/loop " << pretty(search_calls / loop_count)
+					<< " skip/loop " << (100 * skip_count / loop_count) << "%"
+					<< " flop/loop " << (100 * flop_count / loop_count) << "%"
+				);
+			}
 			if (debug_oss) {
 				BEESLOGDEBUG("debug oss trace:\n" << debug_oss->str());
 			}
@@ -2013,7 +2015,7 @@ BeesRoots::open_root_nocache(uint64_t rootid)
 	BEESCOUNT(root_parent_open_try);
 	Fd parent_fd = open_root(parent_rootid);
 	if (!parent_fd) {
-		BEESLOGTRACE("no parent_fd");
+		BEESLOGDEBUG("no parent_fd for " << parent_rootid);
 		BEESCOUNT(root_parent_open_fail);
 		return Fd();
 	}
@@ -2036,7 +2038,7 @@ BeesRoots::open_root_nocache(uint64_t rootid)
 		BEESTRACE("dirid " << dirid << " path " << ino.m_paths.at(0));
 		parent_fd = bees_openat(parent_fd, ino.m_paths.at(0).c_str(), FLAGS_OPEN_DIR);
 		if (!parent_fd) {
-			BEESLOGTRACE("no parent_fd from dirid");
+			BEESLOGDEBUG("no parent_fd from dirid " << dirid << " in parent_rootid " << parent_rootid);
 			BEESCOUNT(root_parent_path_open_fail);
 			return Fd();
 		}
@@ -2044,7 +2046,7 @@ BeesRoots::open_root_nocache(uint64_t rootid)
 	BEESTRACE("openat(" << name_fd(parent_fd) << ", " << name << ")");
 	Fd rv = bees_openat(parent_fd, name.c_str(), FLAGS_OPEN_DIR);
 	if (!rv) {
-		BEESLOGTRACE("open failed for name " << name << ": " << strerror(errno));
+		BEESLOGDEBUG("open failed for name " << name << " in parent_fd " << name_fd(parent_fd) << ": " << strerror(errno));
 		BEESCOUNT(root_open_fail);
 		return rv;
 	}
