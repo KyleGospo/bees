@@ -11,6 +11,9 @@ Source:         %{url}/archive/v%{version}/%{name}-v%{version}.tar.gz
 # https://github.com/Zygo/bees/pull/286
 Patch0:         286.patch
 
+# https://github.com/Zygo/bees/pull/309
+Patch1:         309.patch
+
 BuildRequires:  make
 BuildRequires:  gcc-c++
 BuildRequires:  btrfs-progs-devel
@@ -32,6 +35,7 @@ DEFAULT_MAKE_TARGET=all
 LIBEXEC_PREFIX=%{_libexecdir}/%{name}
 LIB_PREFIX=%{_libdir}
 PREFIX=%{_prefix}
+BINDIR=bin
 SYSTEMD_SYSTEM_UNIT_DIR=%{_unitdir}
 EOF
 
@@ -56,7 +60,7 @@ make test
 %files
 %license COPYING
 %doc README.md
-%{_sbindir}/beesd
+%{_bindir}/beesd
 %{_libexecdir}/%{name}
 %{_unitdir}/beesd@.service
 %{_sysconfdir}/%{name}/
