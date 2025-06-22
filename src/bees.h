@@ -588,8 +588,8 @@ class BeesRoots : public enable_shared_from_this<BeesRoots> {
 	void current_state_set(const BeesCrawlState &bcs);
 	bool crawl_batch(shared_ptr<BeesCrawl> crawl);
 	void clear_caches();
-
 	shared_ptr<BeesCrawl> insert_root(const BeesCrawlState &bcs);
+	bool up_to_date(const BeesCrawlState &bcs);
 
 friend class BeesCrawl;
 friend class BeesFdCache;
@@ -901,5 +901,6 @@ void bees_readahead_pair(int fd, off_t offset, size_t size, int fd2, off_t offse
 void bees_unreadahead(int fd, off_t offset, size_t size);
 void bees_throttle(double time_used, const char *context);
 string format_time(time_t t);
+bool exception_check();
 
 #endif

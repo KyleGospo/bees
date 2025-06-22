@@ -5,6 +5,7 @@
 #include "crucible/cleanup.h"
 #include "crucible/ntoa.h"
 #include "crucible/openat2.h"
+#include "crucible/seeker.h"
 #include "crucible/string.h"
 #include "crucible/table.h"
 #include "crucible/task.h"
@@ -780,10 +781,6 @@ BeesScanModeExtent::SizeTier::create_extent_map(const uint64_t bytenr, const Pro
 
 	BtrfsExtentDataFetcher bedf(m_ctx->root_fd());
 
-	// Collect extent ref tasks as a series of stand-alone events
-	// chained after the first task created, then run the first one.
-	// This prevents other threads from starting to process an
-	// extent until we have all of its refs in the queue.
 	const auto refs_list = make_shared<list<ExtentRef>>();
 	for (const auto &i : log_ino.m_iors) {
 		catch_all([&](){
@@ -899,6 +896,9 @@ BeesScanModeExtent::scan()
 {
 	BEESTRACE("bsm scan");
 
+	// Do nothing if we are throttled
+	if (should_throttle()) return;
+
 	unique_lock<mutex> lock(m_mutex);
 	const auto size_tiers_copy = m_size_tiers;
 	lock.unlock();
@@ -934,12 +934,14 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 
 	// Low-level extent search debugging
 	shared_ptr<ostringstream> debug_oss;
+	const bool debug_oss_only_exceptions = true;
 #if 0
 	// Enable a _lot_ of debugging output
 	debug_oss = make_shared<ostringstream>();
 #endif
 	if (debug_oss) {
 		BtrfsIoctlSearchKey::s_debug_ostream = debug_oss;
+		tl_seeker_debug_str = debug_oss;
 	}
 
 	// Write out the stats no matter how we exit
@@ -967,10 +969,13 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 				);
 			}
 			if (debug_oss) {
-				BEESLOGDEBUG("debug oss trace:\n" << debug_oss->str());
+				if (!debug_oss_only_exceptions || exception_check()) {
+					BEESLOGDEBUG("debug oss trace:\n" << debug_oss->str());
+				}
 			}
 		}
 		BtrfsIoctlSearchKey::s_debug_ostream.reset();
+		tl_seeker_debug_str.reset();
 	});
 
 #define MNE_DEBUG(x) do { \
@@ -1003,7 +1008,9 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 			// There is a lot of debug output.  Dump it if it gets too long
 			if (!debug_oss->str().empty()) {
 				if (crawl_time.age() > 1) {
-					BEESLOGDEBUG("debug oss trace (so far):\n" << debug_oss->str());
+					if (!debug_oss_only_exceptions) {
+						BEESLOGDEBUG("debug oss trace (so far):\n" << debug_oss->str());
+					}
 					debug_oss->str("");
 				}
 			}
@@ -1084,7 +1091,6 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 			++size_low_count;
 
 			// Skip ahead over any below-min-size extents
-			BEESTRACE("min_size " << pretty(lower_size_bound) << " > scale_size " << pretty(m_fetcher.scale_size()));
 			const auto lsb_rounded = lower_size_bound & ~(m_fetcher.scale_size() - 1);
 			// Don't bother doing backward searches when skipping 128K or less.
 			// The search will cost more than reading 32 consecutive extent records.
@@ -1148,7 +1154,7 @@ BeesScanModeExtent::SizeTier::find_next_extent()
 		const auto hold_state = m_crawl->hold_state(this_state);
 		const auto sft = shared_from_this();
 		ostringstream oss;
-		oss << "map_" << to_hex(this_bytenr) << "_" << pretty(this_length);
+		oss << "map_" << hex << this_bytenr << dec << "_" << pretty(this_length);
 		Task create_map_task(oss.str(), [sft, this_bytenr, hold_state, this_length, find_next_task]() {
 			sft->create_extent_map(this_bytenr, hold_state, this_length, find_next_task);
 			BEESCOUNT(crawl_extent);
@@ -1323,23 +1329,25 @@ BeesScanModeExtent::next_transid()
 		}
 		const auto bytenr_offset = min(bi_last_bytenr, max(bytenr, bi.first_bytenr)) - bi.first_bytenr + bi.first_total;
 		const auto bytenr_norm = bytenr_offset / double(fs_size);
-		const auto time_so_far = now - min(now, this_state.m_started);
+		const auto eta_start = min(now, this_state.m_started);
+		const auto time_so_far = now - eta_start;
 		const string start_stamp = strf_localtime(this_state.m_started);
 		string eta_stamp = "-";
 		string eta_pretty = "-";
 		const auto &deferred_finished = deferred_map.at(subvol);
 		const bool finished = deferred_finished.second;
-		if (finished) {
-			// eta_stamp = "idle";
+		if (finished && m_roots->up_to_date(this_state)) {
+			eta_stamp = "idle";
 		} else if (time_so_far > 10 && bytenr_offset > 1024 * 1024 * 1024) {
 			const time_t eta_duration = time_so_far / bytenr_norm;
-			const time_t eta_time = eta_duration + now;
+			const time_t eta_time = eta_duration + eta_start;
+			const time_t eta_remain = eta_time - now;
 			eta_stamp = strf_localtime(eta_time);
-			eta_pretty = pretty_seconds(eta_duration);
+			eta_pretty = pretty_seconds(eta_remain);
 		}
 		const auto &mma = mes.m_map.at(subvol);
 		const auto mma_ratio = mes_sample_size_ok ? (mma.m_bytes / double(mes.m_total)) : 1.0;
-		const auto posn_text = Table::Text(finished ? "idle" : astringprintf("%06d", int(floor(bytenr_norm * 1000000))));
+		const auto posn_text = Table::Text(astringprintf("%06d", int(floor(bytenr_norm * 1000000))));
 		const auto size_text = Table::Text( mes_sample_size_ok ? pretty(fs_size * mma_ratio) : "-");
 		eta.insert_row(Table::endpos, vector<Table::Content> {
 			Table::Text(magic.m_max_size == numeric_limits<uint64_t>::max() ? "max" : pretty(magic.m_max_size)),
@@ -2304,15 +2312,19 @@ BeesCrawl::BeesCrawl(shared_ptr<BeesContext> ctx, BeesCrawlState initial_state) 
 }
 
 bool
+BeesRoots::up_to_date(const BeesCrawlState &bcs)
+{
+	// If we are already at transid_max then we are up to date
+	return bcs.m_max_transid >= transid_max();
+}
+
+bool
 BeesCrawl::restart_crawl_unlocked()
 {
 	const auto roots = m_ctx->roots();
-	const auto next_transid = roots->transid_max();
-
 	auto crawl_state = get_state_end();
 
-	// If we are already at transid_max then we are still finished
-	m_finished = crawl_state.m_max_transid >= next_transid;
+	m_finished = roots->up_to_date(crawl_state);
 
 	if (m_finished) {
 		m_deferred = true;
@@ -2323,7 +2335,7 @@ BeesCrawl::restart_crawl_unlocked()
 
 		// Start new crawl
 		crawl_state.m_min_transid = crawl_state.m_max_transid;
-		crawl_state.m_max_transid = next_transid;
+		crawl_state.m_max_transid = roots->transid_max();
 		crawl_state.m_objectid = 0;
 		crawl_state.m_offset = 0;
 		crawl_state.m_started = current_time;
