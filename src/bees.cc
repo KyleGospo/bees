@@ -228,8 +228,10 @@ bees_readahead_check(int const fd, off_t const offset, size_t const size)
 	auto tup = make_tuple(offset, size, stat_rv.st_dev, stat_rv.st_ino);
 	static mutex s_recent_mutex;
 	static set<decltype(tup)> s_recent;
+	static Timer s_recent_timer;
 	unique_lock<mutex> lock(s_recent_mutex);
-	if (s_recent.size() > BEES_MAX_EXTENT_REF_COUNT) {
+	if (s_recent_timer.age() > 5.0) {
+		s_recent_timer.reset();
 		s_recent.clear();
 		BEESCOUNT(readahead_clear);
 	}
@@ -253,7 +255,7 @@ bees_readahead_nolock(int const fd, const off_t offset, const size_t size)
 	// The btrfs kernel code does readahead with lower ioprio
 	// and might discard the readahead request entirely.
 	BEESNOTE("emulating readahead " << name_fd(fd) << " offset " << to_hex(offset) << " len " << pretty(size));
-	auto working_size = size;
+	auto working_size = min(size, uint64_t(128 * 1024 * 1024));
 	auto working_offset = offset;
 	while (working_size) {
 		// don't care about multithreaded writes to this buffer--it is garbage anyway
