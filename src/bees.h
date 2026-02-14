@@ -44,9 +44,11 @@ const off_t BLOCK_SIZE_MAX_EXTENT_SAME = 4096 * 4096;
 const off_t BLOCK_SIZE_MAX_COMPRESSED_EXTENT = 128 * 1024;
 
 // Maximum length of any extent in bytes
-// except we've seen 1.03G extents...
-// ...FIEMAP is slow and full of lies
-const off_t BLOCK_SIZE_MAX_EXTENT = 128 * 1024 * 1024;
+// Kernel commit 24542bf7ea5e4fdfdb5157ff544c093fa4dcb536
+// ("btrfs: limit fallocate extent reservation to 256MB")
+// introduces a bug where prealloc extents can be 256M long
+// instead of BTRFS_MAX_EXTENT_SIZE, i.e. 128M.
+const off_t BLOCK_SIZE_MAX_EXTENT = 256 * 1024 * 1024;
 
 // Masks, so we don't have to write "(BLOCK_SIZE_CLONE - 1)" everywhere
 const off_t BLOCK_MASK_CLONE = BLOCK_SIZE_CLONE - 1;
@@ -97,7 +99,13 @@ const double BEES_TOXIC_SYS_DURATION = 5.0;
 
 // Maximum number of refs to a single extent before we have other problems
 // If we have more than 10K refs to an extent, adding another will save 0.01% space
-const size_t BEES_MAX_EXTENT_REF_COUNT = 9999; // (16 * 1024 * 1024 / 24);
+// The kernel limit is (16 * 1024 * 1024 / 24), but this is far too large for practical dedupe.
+const size_t BEES_MAX_EXTENT_REF_COUNT = 9999;
+
+// Maximum number of extent tasks in the in-memory queue
+// More tasks = more memory, but also more parallel execution
+// Fewer tasks = less queue delay, so restart after shutdown repeats less work
+const size_t BEES_MAX_EXTENT_TASK_COUNT = 9999;
 
 // How long between hash table histograms
 const double BEES_HASH_TABLE_ANALYZE_INTERVAL = BEES_STATS_INTERVAL;
@@ -123,8 +131,8 @@ const int FLAGS_OPEN_FANOTIFY = O_RDWR | O_NOATIME | O_CLOEXEC | O_LARGEFILE;
 
 #define BEESLOG(lv,x)   do { if (lv < bees_log_level) { Chatter __chatter(lv, BeesNote::get_name()); __chatter << x; } } while (0)
 
-#define BEES_TRACE_LEVEL LOG_DEBUG
-#define BEESTRACE(x)   BeesTracer  SRSLY_WTF_C(beesTracer_,  __LINE__) ([&]()                 { BEESLOG(BEES_TRACE_LEVEL, "TRACE: " << x << " at " << __FILE__ << ":" << __LINE__);   })
+extern int bees_trace_level;
+#define BEESTRACE(x)   BeesTracer  SRSLY_WTF_C(beesTracer_,  __LINE__) ([&]()                 { BEESLOG(bees_trace_level, "TRACE: " << x << " at " << __FILE__ << ":" << __LINE__);   })
 #define BEESTOOLONG(x) BeesTooLong SRSLY_WTF_C(beesTooLong_, __LINE__) ([&](ostream &_btl_os) { _btl_os << x; })
 #define BEESNOTE(x)    BeesNote    SRSLY_WTF_C(beesNote_,    __LINE__) ([&](ostream &_btl_os) { _btl_os << x; })
 

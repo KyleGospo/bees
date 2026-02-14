@@ -694,7 +694,7 @@ static
 void
 block_signals()
 {
-	BEESLOGDEBUG("Masking signals");
+	BEESTRACE("Masking signals");
 
 	DIE_IF_NON_ZERO(sigemptyset(&new_sigset));
 	DIE_IF_NON_ZERO(sigaddset(&new_sigset, SIGTERM));
@@ -753,7 +753,7 @@ bees_main(int argc, char *argv[])
 			BEESLOGDEBUG("exception (ignored): " << s);
 			BEESCOUNT(exception_caught_silent);
 		} else {
-			BEESLOG(BEES_TRACE_LEVEL, "TRACE: EXCEPTION: " << s);
+			BEESLOG(bees_trace_level, "TRACE: EXCEPTION: " << s);
 			BEESCOUNT(exception_caught);
 		}
 	});
@@ -772,7 +772,7 @@ bees_main(int argc, char *argv[])
 
 	// Create a context so we can apply configuration to it
 	shared_ptr<BeesContext> bc = make_shared<BeesContext>();
-	BEESLOGDEBUG("context constructed");
+	BEESTRACE("context constructed");
 
 	// Defaults
 	bool use_relative_paths = false;
