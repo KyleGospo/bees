@@ -162,16 +162,6 @@ namespace crucible {
 		return m_handle;
 	}
 
-	// XXX: necessary?  useful?
-	template <>
-	struct ChatterTraits<Fd> {
-		Chatter &operator()(Chatter &c, const Fd &fd) const
-		{
-			c << "Fd {this=" << &fd << " fd=" << static_cast<int>(fd) << "}";
-			return c;
-		}
-	};
-
 	int
 	open_or_die(const string &file, int flags, mode_t mode)
 	{
