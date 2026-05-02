@@ -316,25 +316,6 @@ BeesRangePair::BeesRangePair(const BeesFileRange &src, const BeesFileRange &dst)
 
 	// Must initially be equal
 	THROW_CHECK2(invalid_argument, first, second, first.size() == second.size());
-
-	// Can't check content unless open
-	if (!first.fd() || !second.fd()) {
-		return;
-	}
-
-	// Must check every block individually
-	off_t first_begin = first.begin();
-	off_t second_begin = second.begin();
-	off_t size = first.size();
-	while (size) {
-		off_t len = min(BLOCK_SIZE_SUMS, size);
-		BeesBlockData first_bbd(first.fd(), first_begin, len);
-		BeesBlockData second_bbd(second.fd(), second_begin, len);
-		THROW_CHECK2(invalid_argument, first_bbd, second_bbd, first_bbd.is_data_equal(second_bbd));
-		first_begin += len;
-		second_begin += len;
-		size -= len;
-	}
 }
 
 bool

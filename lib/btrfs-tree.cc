@@ -417,6 +417,7 @@ namespace crucible {
 	#define BTFRLB_DEBUG(x) CRUCIBLE_BTRFS_TREE_DEBUG(x)
 	#endif
 		BtrfsTreeItem closest_item;
+		bool have_closest = false;
 		uint64_t closest_logical = 0;
 		BtrfsIoctlSearchKey &sk = m_sk;
 		size_t loops = 0;
@@ -452,7 +453,8 @@ namespace crucible {
 						BTFRLB_DEBUG("(" << to_hex(scaled_hdr_logical) << " >= " << to_hex(upper_bound) << ")");
 						break;
 					}
-					if (this_logical <= logical && this_logical > closest_logical) {
+					if (this_logical <= logical && (!have_closest || this_logical > closest_logical)) {
+						have_closest = true;
 						closest_logical = this_logical;
 						closest_item = i;
 						BTFRLB_DEBUG("(closest)");

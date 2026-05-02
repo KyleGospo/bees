@@ -162,16 +162,6 @@ namespace crucible {
 		return m_handle;
 	}
 
-	// XXX: necessary?  useful?
-	template <>
-	struct ChatterTraits<Fd> {
-		Chatter &operator()(Chatter &c, const Fd &fd) const
-		{
-			c << "Fd {this=" << &fd << " fd=" << static_cast<int>(fd) << "}";
-			return c;
-		}
-	};
-
 	int
 	open_or_die(const string &file, int flags, mode_t mode)
 	{
@@ -540,14 +530,14 @@ namespace crucible {
 		// Start with a reasonable guess since it will usually work
 		off_t size = 4096;
 		while (size < 1048576) {
-			char buf[size + 1];
+			vector<char> buf(size + 1);
 			int rv;
-			DIE_IF_MINUS_ONE(rv = readlink(path.c_str(), buf, size + 1));
+			DIE_IF_MINUS_ONE(rv = readlink(path.c_str(), buf.data(), size + 1));
 			// No negative values allowed except -1
 			THROW_CHECK1(runtime_error, rv, rv >= 0);
 			if (rv <= size) {
 				buf[rv] = 0;
-				return buf;
+				return buf.data();
 			}
 			// cerr << "Retrying readlink(" << path << ", buf, " << size + 1 << ")" << endl;
 			// This is from the Linux readlink(2) man page (release 3.44).

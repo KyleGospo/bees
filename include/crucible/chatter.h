@@ -69,29 +69,6 @@ namespace crucible {
 		return ChatterTraits<T>()(*this, arg);
 	}
 
-	template <class Argument>
-	struct ChatterTraits<const Argument *> {
-		Chatter &operator()(Chatter &c, const Argument *arg)
-		{
-			if (arg) {
-				c.get_os() << "(pointer to " << typeid(*arg).name() << ")(" << reinterpret_cast<const void *>(arg) << ")";
-			} else {
-				c.get_os() << "(NULL pointer to " << typeid(arg).name() << ')';
-			}
-			return c;
-		}
-	};
-
-	template <>
-	struct ChatterTraits<const char *> {
-		Chatter &
-		operator()(Chatter &c, const char *arg)
-		{
-			c.get_os() << arg;
-			return c;
-		}
-	};
-
 	class ChatterBox {
 		string m_file;
 		int m_line;

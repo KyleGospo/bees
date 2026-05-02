@@ -54,6 +54,7 @@ More Information
 ----------------
 
  * [How bees works](docs/how-it-works.md)
+ * [How scan_one matches extents](docs/scan-one-algorithm.md)
  * [Missing bees features](docs/missing.md)
  * [Event counter descriptions](docs/event-counters.md)
 
