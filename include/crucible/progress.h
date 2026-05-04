@@ -90,7 +90,7 @@ namespace crucible {
 
 	template <class T>
 	ProgressTracker<T>::ProgressTracker(const ProgressTracker::value_type &t) :
-		m_state(make_shared<ProgressTrackerState>())
+		m_state(make_unique<ProgressTrackerState>())
 	{
 		m_state->m_begin = t;
 		m_state->m_end = t;
